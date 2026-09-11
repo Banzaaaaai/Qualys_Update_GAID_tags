@@ -1,0 +1,7 @@
+qualys_creds.txt
+gaid_update_report_*.csv
+gaid_update_report_*.xlsx
+backup_gaid_tags_*.json
+backup_gaid_tags_*.xlsx
+__pycache__/
+*.pyc
