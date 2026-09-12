@@ -14,8 +14,7 @@ WHAT IT DOES (see README.md for the rationale behind each rule):
     NETWORK_RANGE tag, same id and name.
   * In file + not in tenant             -> created under
     "[VFZ] Global Application Inventory".
-  * Not in file, or every row for the GAID is Out of Service -> deleted
-    (needs --apply --allow-delete).
+  * Not in file, or every row for the GAID is Out of Service -> deleted.
   * NAME_CONTAINS tags are never written to; other unexpected rule types are
     refused rather than guessed at.
 
@@ -27,10 +26,11 @@ HARD CONSTRAINTS:
    ruleType) changes. Never delete+recreate, because Qualys access scope is
    bound to tag identity.
 
-Safety: dry-run by default; nothing is written without --apply, and nothing
-is deleted without --allow-delete on top of it. Every tag that will be
-modified or deleted is backed up first, and every write is verified by
-reading the tag back.
+RUN MODE: this script performs the REAL run by default -- it writes to
+Qualys, deletions included. Pass --dry-run to preview without writing.
+Every tag that will be modified or deleted is backed up to
+backup_gaid_tags_<UTC>.json/.xlsx before the first write call, and every
+write is verified by reading the tag back.
 """
 
 import argparse
@@ -865,7 +865,8 @@ def write_xlsx_report(rows, path, run_meta=None):
     # --- Summary sheet ---
     ws = wb.create_sheet("Summary")
     mode = (run_meta or {}).get("Run mode", "")
-    ws.append([f"Qualys GAID Tag Update - {'Applied' if 'APPLY' in mode else 'Dry Run'} Report"])
+    is_dry = "DRY" in mode.upper()
+    ws.append([f"Qualys GAID Tag Update - {'Dry Run' if is_dry else 'REAL RUN (changes applied)'} Report"])
     ws["A1"].font = Font(bold=True, size=14)
     ws.append([])
 
@@ -933,27 +934,37 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("excel_path", help="Path to the CMDB Excel export")
     parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually write changes to Qualys. Without this flag, runs as a dry-run.",
-    )
-    parser.add_argument(
-        "--allow-delete",
+        "--dry-run",
         action="store_true",
         help=(
-            "Permit deletion of GAID tags whose GAID is absent from the file. "
-            "Requires --apply. Deletion is irreversible and detaches the tag "
-            "from every asset it is applied to, so it is opt-in separately."
+            "Preview only: compute and report every change but make NO write "
+            "calls to Qualys. Without this flag the script performs the real "
+            "run -- updates, conversions, creates AND deletions."
         ),
     )
+    # Accepted so the previous invocation still works; the real run is now
+    # the default, so neither flag changes anything.
+    parser.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--allow-delete", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    if args.allow_delete and not args.apply:
-        print("NOTE: --allow-delete has no effect without --apply; this is still a dry run.")
+    # The real run is the default: writes happen unless --dry-run is given.
+    # The rest of the script still reads args.apply / args.allow_delete, so
+    # derive them here rather than threading a new flag through everything.
+    args.apply = not args.dry_run
+    args.allow_delete = not args.dry_run
+
+    if args.apply:
+        print("*" * 72)
+        print("REAL RUN - changes WILL be written to Qualys, including DELETIONS.")
+        print("Every tag that will be modified or deleted is backed up first.")
+        print("Use --dry-run to preview without writing.")
+        print("*" * 72)
+        print()
 
     print(f"=== Discovery: {args.excel_path} ===")
     _, _, rows, gaid_col, ip_col, status_col, asset_col = discover_excel(args.excel_path)
@@ -995,7 +1006,7 @@ def main():
     print(f"Found {len(gaid_tags_by_name)} existing '{GAID_TAG_PREFIX}*' tags in the tenant.")
 
     run_meta = {
-        "Run mode": "APPLY (writes to Qualys)" if args.apply else "DRY RUN (no writes)",
+        "Run mode": "REAL RUN (writes to Qualys)" if args.apply else "DRY RUN (no writes)",
         "Run at (UTC)": datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         ),
@@ -1249,7 +1260,7 @@ def main():
 
     # --- dry-run: print plan and exit ---
     if not args.apply:
-        print("=== DRY RUN: no changes will be written. Pass --apply to write. ===")
+        print("=== DRY RUN: no changes will be written. Omit --dry-run for the real run. ===")
         print_action_plan(report_rows)
         write_reports(report_rows, run_meta)
         print_summary(report_rows, applied=False)

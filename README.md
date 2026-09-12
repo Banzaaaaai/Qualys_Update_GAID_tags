@@ -5,31 +5,34 @@ tenant (EU2 pod) against a CMDB Excel export, which is treated as the
 authoritative source. Updates, converts, creates and deletes tags so the
 tenant matches the file.
 
-**Dry-run by default — nothing is written to Qualys without `--apply`.**
+> **⚠ The default run is REAL.** Running the script with no flags writes to
+> Qualys — updates, conversions, creates **and deletions**. Use `--dry-run`
+> to preview.
 
 ---
 
 ## Usage
 
 ```bash
-# dry-run (default): no writes of any kind, produces the change report
+# REAL RUN (default): updates + conversions + creates + deletions
 python update_gaid_tags.py asset-resource-owner.xlsx
 
-# updates + conversions + creates; deletions are reported but skipped
-python update_gaid_tags.py asset-resource-owner.xlsx --apply
-
-# the above, plus deletions
-python update_gaid_tags.py asset-resource-owner.xlsx --apply --allow-delete
+# preview only: no write calls of any kind, produces the same report
+python update_gaid_tags.py asset-resource-owner.xlsx --dry-run
 ```
 
 - The Excel path is `argv[1]`.
-- `--apply` alone **never deletes**. Deletion is irreversible, detaches the
-  tag from every asset it is applied to, and breaks any Qualys access scope
-  bound to that tag's identity, so it requires the separate `--allow-delete`
-  opt-in. Without it, deletion candidates are reported as `untouched` with a
-  note explaining why they were skipped.
-- Recommended rollout: run `--apply` first (fully recoverable from the
-  backup), verify the tenant, then a second pass with `--allow-delete`.
+- `--apply` and `--allow-delete` are still accepted so older invocations keep
+  working, but they no longer change anything — the real run is the default.
+- **Deletions are irreversible.** They detach the tag from every asset it is
+  applied to and break any Qualys access scope bound to that tag's identity.
+  For a static tag, the backup captures the definition but not its manual
+  asset assignments, so those cannot be restored.
+- Before changing anything the script writes
+  `backup_gaid_tags_<UTC>.json` / `.xlsx` covering every tag it will modify
+  or delete, and it verifies every write by reading the tag back.
+- Run `--dry-run` first and read the report whenever the source file or the
+  tenant has changed materially.
 
 ### Credentials
 
@@ -162,7 +165,7 @@ Each GAID is matched to the Qualys tag named exactly
   exists the row aborts rather than creating a duplicate, which would make
   later runs ambiguous about which id to update.
 
-### Delete — requires `--apply --allow-delete`
+### Delete — happens on a real run
 
 Two independent reasons:
 
