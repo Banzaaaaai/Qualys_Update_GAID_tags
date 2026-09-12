@@ -1,17 +1,36 @@
-"""Bulk-update GAID Asset Management tags in Qualys (EU2 pod) from a CMDB Excel export.
+"""Reconcile GAID Asset Management tags in Qualys (EU2 pod) with a CMDB Excel export.
+
+The Excel file is authoritative. For each "[VFZ] GAID: <n>" tag the script
+updates, converts, creates or deletes so the tenant matches the file.
 
 Credentials are never read from argv/hardcoded; they come from the
 QUALYS_USERNAME / QUALYS_PASSWORD env vars, falling back to
 qualys_creds.txt next to this script (format: "key:\\tvalue" per line).
 
-HARD CONSTRAINTS (see README.md for the full rationale):
+WHAT IT DOES (see README.md for the rationale behind each rule):
+  * In file + in tenant (NETWORK_RANGE) -> ruleText replaced with EXACTLY the
+    file's IP set. Complete replacement, never a merge.
+  * In file + in tenant (static)        -> converted in place to a dynamic
+    NETWORK_RANGE tag, same id and name.
+  * In file + not in tenant             -> created under
+    "[VFZ] Global Application Inventory".
+  * Not in file, or every row for the GAID is Out of Service -> deleted
+    (needs --apply --allow-delete).
+  * NAME_CONTAINS tags are never written to; other unexpected rule types are
+    refused rather than guessed at.
+
+HARD CONSTRAINTS:
 1. COMPLETE REPLACEMENT of each GAID tag's IP/range list with the set from
    the Excel file -- never a merge/union with what is currently in Qualys.
-2. UPDATE IN PLACE. The tag keeps its id/name/parent/color/criticality --
-   only the ruleText (IP/range list) changes. Never delete+recreate.
+2. EXISTING TAGS ARE UPDATED IN PLACE. The tag keeps its
+   id/name/parent/color/criticality -- only ruleText (and, for a static tag,
+   ruleType) changes. Never delete+recreate, because Qualys access scope is
+   bound to tag identity.
 
-Safety: dry-run by default. Nothing is written to Qualys unless --apply is
-passed. Every touched tag is backed up before any write call.
+Safety: dry-run by default; nothing is written without --apply, and nothing
+is deleted without --allow-delete on top of it. Every tag that will be
+modified or deleted is backed up first, and every write is verified by
+reading the tag back.
 """
 
 import argparse
@@ -23,6 +42,8 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+
+from xml.sax.saxutils import escape as xml_escape
 
 import requests
 from openpyxl import Workbook, load_workbook
@@ -36,6 +57,8 @@ from openpyxl.utils import get_column_letter
 BASE_URL = "https://qualysapi.qg2.apps.qualys.eu"
 TAG_SEARCH_URL = f"{BASE_URL}/qps/rest/2.0/search/am/tag"
 TAG_UPDATE_URL = f"{BASE_URL}/qps/rest/2.0/update/am/tag/{{tag_id}}"
+TAG_CREATE_URL = f"{BASE_URL}/qps/rest/2.0/create/am/tag"
+TAG_DELETE_URL = f"{BASE_URL}/qps/rest/2.0/delete/am/tag/{{tag_id}}"
 
 # Confirmed 2026-09-12 against a live tag ("[VFZ] GAID: 1356", id 189526283):
 # name is exactly this prefix + the GAID number, parent is the fixed tag
@@ -44,6 +67,27 @@ TAG_UPDATE_URL = f"{BASE_URL}/qps/rest/2.0/update/am/tag/{{tag_id}}"
 GAID_TAG_PREFIX = "[VFZ] GAID: "
 GAID_PARENT_TAG_NAME = "[VFZ] Global Application Inventory"
 EXPECTED_RULE_TYPE = "NETWORK_RANGE"
+
+# Rule types that are never written to, whatever the file says. A
+# NAME_CONTAINS tag matches assets by hostname pattern (one in this tenant
+# holds a regex); overwriting it with an IP list would silently destroy that
+# rule, so it is reported and skipped.
+NEVER_UPDATE_RULE_TYPES = {"NAME_CONTAINS"}
+
+# A static tag has no rule at all -- Qualys returns either no ruleType
+# element (empty string here) or "STATIC". When the file supplies IPs for
+# such a GAID, the tag is converted in place to a dynamic NETWORK_RANGE tag;
+# when it does not, the tag is left alone.
+STATIC_RULE_TYPES = {"", "STATIC"}
+
+# Attributes given to newly created GAID tags, mirroring the convention of
+# tags that already exist in the tenant (e.g. "Toolbox (GAID: 1356)",
+# color "#FF"). The parent tag id is resolved at runtime by looking up
+# GAID_PARENT_TAG_NAME, so it is never hardcoded/stale. Set NEW_TAG_COLOR to
+# "" to omit the color element entirely.
+NEW_TAG_COLOR = "#FF"
+NEW_TAG_DESCRIPTION_TEMPLATE = "{asset} (GAID: {gaid})"
+ASSET_NAME_COLUMN_PATTERNS = [r"^\s*asset\s*$", r"asset\s*name", r"application\s*name"]
 
 INITIAL_DELAY = 1
 MAX_RETRIES = 5
@@ -60,6 +104,7 @@ REPORT_COLUMNS = [
     "tag_id",
     "tag_name",
     "status",
+    "file_resource_status",
     "old_ip_summary",
     "new_ip_summary",
     "ips_added",
@@ -82,9 +127,34 @@ IP_COLUMN_PATTERNS = [
     r"\bip(s)?\b",
 ]
 
+# A row's IP only counts toward a GAID's new set if this column (when
+# present) has one of these values (case-insensitive). Rows whose resource
+# is e.g. "Out of Service" or "Planned Decommission" are excluded -- an
+# explicit choice confirmed against a real CMDB export on 2026-09-12, where
+# ~12% of IP-bearing rows were "Out of Service". If no column matches these
+# patterns, filtering is skipped (all rows included) and a warning is
+# printed.
+RESOURCE_STATUS_COLUMN_PATTERNS = [r"resource\s*status"]
+INCLUDE_RESOURCE_STATUSES = {"in service"}
+
+# A GAID that is present in the file is treated as decommissioned -- and its
+# tag deleted -- only when EVERY one of its rows carries one of these
+# statuses. Requiring every row (not just the IP-bearing ones) is deliberate:
+# in a real export, 7 GAIDs had all their IP-bearing rows "Out of Service"
+# while still having "In Service" resources that simply carry no IP address
+# (databases, load balancers). Those applications are live, and deleting
+# their tags would have been wrong and irreversible. A blank/unknown status
+# is not in this set, so it also blocks deletion.
+DELETE_ON_RESOURCE_STATUSES = {"out of service"}
+
 # Tokens are split out of a cell (and across rows for the same GAID) on any
 # of these separators.
 IP_CELL_SPLIT_RE = re.compile(r"[,;\n\r]+")
+
+# Safety cap on how many addresses a single "A-B" range may expand to, so a
+# garbage/typo'd range (e.g. a full /8) can't blow up memory -- real GAID
+# ranges observed in the tenant are at most a few hundred addresses wide.
+MAX_RANGE_SIZE = 1_000_000
 
 
 # --------------------------------------------------------------------------
@@ -251,6 +321,9 @@ def parse_tag_elements(data_elem):
                 "rule_text": get_text(tag_elem, "ruleText"),
                 "color": get_text(tag_elem, "color"),
                 "criticality": get_text(tag_elem, "criticalityScore"),
+                "description": get_text(tag_elem, "description"),
+                "created": get_text(tag_elem, "created"),
+                "modified": get_text(tag_elem, "modified"),
             }
         )
     return tags
@@ -294,11 +367,25 @@ def fetch_tag_by_id(session, tag_id):
     xml_body = (
         "<ServiceRequest>"
         "<filters>"
-        f'<Criteria field="id" operator="EQUALS">{tag_id}</Criteria>'
+        f'<Criteria field="id" operator="EQUALS">{xml_escape(str(tag_id))}</Criteria>'
         "</filters>"
         "</ServiceRequest>"
     )
     root = request_with_retry(session, "POST", TAG_SEARCH_URL, xml_body, f"verify tag {tag_id}")
+    data_elem = find_child(root, "data")
+    tags = parse_tag_elements(data_elem)
+    return tags[0] if tags else None
+
+
+def fetch_tag_by_name(session, name):
+    xml_body = (
+        "<ServiceRequest>"
+        "<filters>"
+        f'<Criteria field="name" operator="EQUALS">{xml_escape(name)}</Criteria>'
+        "</filters>"
+        "</ServiceRequest>"
+    )
+    root = request_with_retry(session, "POST", TAG_SEARCH_URL, xml_body, f"verify tag {name!r}")
     data_elem = find_child(root, "data")
     tags = parse_tag_elements(data_elem)
     return tags[0] if tags else None
@@ -309,10 +396,15 @@ def fetch_tag_by_id(session, tag_id):
 # --------------------------------------------------------------------------
 
 
-def parse_ip_entry(token):
+def expand_entry_to_ints(token):
     """Validate one token as an IPv4 address or 'A-B' range.
 
-    Returns the canonical string form and a sort key, or raises ValueError.
+    Returns the set of individual address integers it covers, or raises
+    ValueError. Expanding to individual addresses (rather than keeping the
+    token as an opaque string) is what lets us correctly compare a tag whose
+    current ruleText uses compressed ranges against a CMDB export that lists
+    the same hosts as separate single-IP rows -- same address set, different
+    surface form.
     """
     token = token.strip()
     if not token:
@@ -320,24 +412,52 @@ def parse_ip_entry(token):
 
     if "-" in token:
         start_s, _, end_s = token.partition("-")
-        start_s = start_s.strip()
-        end_s = end_s.strip()
-        start = ipaddress.IPv4Address(start_s)
-        end = ipaddress.IPv4Address(end_s)
+        start = ipaddress.IPv4Address(start_s.strip())
+        end = ipaddress.IPv4Address(end_s.strip())
         if int(end) < int(start):
             raise ValueError(f"range end before start: {token}")
-        return f"{start}-{end}", int(start)
+        if int(end) - int(start) + 1 > MAX_RANGE_SIZE:
+            raise ValueError(f"range too large ({token})")
+        return set(range(int(start), int(end) + 1))
 
-    addr = ipaddress.IPv4Address(token)
-    return str(addr), int(addr)
+    return {int(ipaddress.IPv4Address(token))}
+
+
+def compact_ints_to_entries(int_set):
+    """Merge a set of address integers into the minimal sorted list of
+    single-IP / 'A-B' range strings covering exactly that set."""
+    if not int_set:
+        return []
+    ordered = sorted(int_set)
+    runs = []
+    start = prev = ordered[0]
+    for n in ordered[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        runs.append((start, prev))
+        start = prev = n
+    runs.append((start, prev))
+
+    entries = []
+    for a, b in runs:
+        if a == b:
+            entries.append(str(ipaddress.IPv4Address(a)))
+        else:
+            entries.append(f"{ipaddress.IPv4Address(a)}-{ipaddress.IPv4Address(b)}")
+    return entries
 
 
 def normalize_ip_set(raw_tokens):
-    """Validate + dedupe + sort a collection of raw IP/range tokens.
+    """Validate every token, union them at the individual-address level, and
+    recompact into the minimal sorted range representation.
 
-    Returns (canonical_sorted_list, invalid_tokens).
+    Returns (canonical_sorted_list, invalid_tokens). Recompacting from
+    scratch (rather than trusting each token's own single/range shape) means
+    the result is identical regardless of whether the input expressed a
+    given set of hosts as one range or as many single IPs.
     """
-    canonical = {}
+    all_ints = set()
     invalid = []
     for token in raw_tokens:
         if token is None:
@@ -346,13 +466,12 @@ def normalize_ip_set(raw_tokens):
         if not token:
             continue
         try:
-            canon, sort_key = parse_ip_entry(token)
+            all_ints |= expand_entry_to_ints(token)
         except ValueError:
             invalid.append(token)
             continue
-        canonical[canon] = sort_key
 
-    ordered = sorted(canonical.keys(), key=lambda c: canonical[c])
+    ordered = compact_ints_to_entries(all_ints)
     return ordered, invalid
 
 
@@ -420,6 +539,8 @@ def discover_excel(path):
 
     gaid_col = find_column(headers, GAID_COLUMN_PATTERNS)
     ip_col = find_column(headers, IP_COLUMN_PATTERNS)
+    status_col = find_column(headers, RESOURCE_STATUS_COLUMN_PATTERNS)
+    asset_col = find_column(headers, ASSET_NAME_COLUMN_PATTERNS)
 
     if gaid_col is None or ip_col is None:
         raise RuntimeError(
@@ -446,14 +567,70 @@ def discover_excel(path):
         "semicolons/newlines and grouped by GAID, so both layouts are "
         "handled by the same aggregation logic.)"
     )
+    if asset_col is not None:
+        print(
+            f"  Asset name column: {headers[asset_col]!r} (index {asset_col}) "
+            "-- used for the description of newly created tags."
+        )
+    else:
+        print(
+            "  WARNING: no asset-name column matched "
+            f"{ASSET_NAME_COLUMN_PATTERNS!r}; new tags will be created without "
+            "a description."
+        )
+    if status_col is not None:
+        print(
+            f"  Resource status column: {headers[status_col]!r} (index {status_col}) "
+            f"-- only rows with status in {sorted(INCLUDE_RESOURCE_STATUSES)!r} "
+            "contribute IPs; others are excluded."
+        )
+    else:
+        print(
+            "  WARNING: no resource-status column matched "
+            f"{RESOURCE_STATUS_COLUMN_PATTERNS!r}; all rows will contribute "
+            "IPs regardless of status."
+        )
     print()
 
-    return sheet_name, headers, rows, gaid_col, ip_col
+    return sheet_name, headers, rows, gaid_col, ip_col, status_col, asset_col
 
 
-def build_gaid_ip_map(rows, gaid_col, ip_col):
-    """Group raw IP tokens by GAID, across however many rows each GAID has."""
+def collect_file_gaids(rows, gaid_col, asset_col=None):
+    """Every GAID appearing in the file's GAID column, regardless of whether
+    it has IP rows or survives the status filter, plus its asset name.
+
+    Deletion keys off this set -- "absent from the file" must mean the GAID
+    number is nowhere in the export, NOT merely that it contributed no IPs.
+    """
+    all_gaids = set()
+    asset_by_gaid = {}
+    for row in rows:
+        gaid_key = normalize_gaid_key(row[gaid_col])
+        if gaid_key is None:
+            continue
+        all_gaids.add(gaid_key)
+        if asset_col is not None and gaid_key not in asset_by_gaid:
+            asset = row[asset_col]
+            if asset is not None and str(asset).strip():
+                asset_by_gaid[gaid_key] = str(asset).strip()
+    return all_gaids, asset_by_gaid
+
+
+def build_gaid_ip_map(rows, gaid_col, ip_col, status_col=None):
+    """Group raw IP tokens by GAID, across however many rows each GAID has.
+
+    Rows are excluded from contributing IPs when status_col is given and the
+    row's value there is not in INCLUDE_RESOURCE_STATUSES (case-insensitive).
+    Returns (raw_by_gaid, excluded_row_count, excluded_ip_token_count,
+    fully_filtered_gaids) -- the last is the set of GAIDs that had at least
+    one IP-bearing row in the file, but every single one was excluded by the
+    status filter, so they carry zero IPs into the update logic even though
+    they're technically "in the file".
+    """
     raw_by_gaid = {}
+    seen_any_ip_row = set()
+    excluded_rows = 0
+    excluded_tokens = 0
     for row in rows:
         gaid_key = normalize_gaid_key(row[gaid_col])
         if gaid_key is None:
@@ -461,9 +638,75 @@ def build_gaid_ip_map(rows, gaid_col, ip_col):
         cell = row[ip_col]
         if cell is None:
             continue
+        seen_any_ip_row.add(gaid_key)
+
+        if status_col is not None:
+            status_value = row[status_col]
+            status_norm = str(status_value).strip().lower() if status_value is not None else ""
+            if status_norm not in INCLUDE_RESOURCE_STATUSES:
+                excluded_rows += 1
+                excluded_tokens += len(IP_CELL_SPLIT_RE.split(str(cell)))
+                continue
+
         tokens = IP_CELL_SPLIT_RE.split(str(cell))
         raw_by_gaid.setdefault(gaid_key, []).extend(tokens)
-    return raw_by_gaid
+
+    fully_filtered_gaids = seen_any_ip_row - set(raw_by_gaid.keys())
+    return raw_by_gaid, excluded_rows, excluded_tokens, fully_filtered_gaids
+
+
+def find_decommissioned_gaids(rows, gaid_col, status_col):
+    """GAIDs whose EVERY row is in DELETE_ON_RESOURCE_STATUSES.
+
+    All rows count here, including rows with no IP address -- a single
+    still-in-service resource anywhere under a GAID means the application is
+    alive and its tag must not be deleted.
+    """
+    if status_col is None:
+        return set()
+
+    statuses_by_gaid = {}
+    for row in rows:
+        gaid_key = normalize_gaid_key(row[gaid_col])
+        if gaid_key is None:
+            continue
+        status_value = row[status_col]
+        label = str(status_value).strip().lower() if status_value is not None else ""
+        statuses_by_gaid.setdefault(gaid_key, set()).add(label)
+
+    return {
+        gaid_key
+        for gaid_key, labels in statuses_by_gaid.items()
+        if labels and labels <= DELETE_ON_RESOURCE_STATUSES
+    }
+
+
+def build_status_summary(rows, gaid_col, ip_col, status_col):
+    """Per GAID, a readable breakdown of RESOURCE STATUS across the rows that
+    actually carry an IP -- e.g. "In Service: 5, Out of Service: 2".
+
+    Only IP-bearing rows are counted, because rows without an IP cannot
+    affect the tag's address set either way; counting them would just
+    obscure why a GAID's IPs changed (or why it ended up untouched).
+    """
+    if status_col is None:
+        return {}
+
+    counts_by_gaid = {}
+    for row in rows:
+        gaid_key = normalize_gaid_key(row[gaid_col])
+        if gaid_key is None or row[ip_col] is None:
+            continue
+        status_value = row[status_col]
+        label = str(status_value).strip() if status_value is not None else "(blank)"
+        counts = counts_by_gaid.setdefault(gaid_key, {})
+        counts[label] = counts.get(label, 0) + 1
+
+    summary = {}
+    for gaid_key, counts in counts_by_gaid.items():
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        summary[gaid_key] = ", ".join(f"{label}: {n}" for label, n in ordered)
+    return summary
 
 
 # --------------------------------------------------------------------------
@@ -481,7 +724,18 @@ def write_backup(touched_tags, timestamp):
     wb = Workbook()
     ws = wb.active
     ws.title = "Backup"
-    cols = ["tag_id", "tag_name", "parent_tag_id", "rule_type", "rule_text", "color", "criticality"]
+    cols = [
+        "tag_id",
+        "tag_name",
+        "parent_tag_id",
+        "rule_type",
+        "rule_text",
+        "color",
+        "criticality",
+        "description",
+        "created",
+        "modified",
+    ]
     ws.append(cols)
     for cell in ws[1]:
         cell.font = Font(bold=True)
@@ -489,7 +743,18 @@ def write_backup(touched_tags, timestamp):
         ws.append([t.get(c, "") for c in cols])
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
-    widths = {"tag_id": 12, "tag_name": 24, "parent_tag_id": 14, "rule_type": 16, "rule_text": 80, "color": 10, "criticality": 12}
+    widths = {
+        "tag_id": 12,
+        "tag_name": 24,
+        "parent_tag_id": 14,
+        "rule_type": 16,
+        "rule_text": 80,
+        "color": 10,
+        "criticality": 12,
+        "description": 40,
+        "created": 22,
+        "modified": 22,
+    }
     for idx, col in enumerate(cols, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = widths.get(col, 15)
     wb.save(xlsx_path)
@@ -514,37 +779,140 @@ def write_csv_report(rows, path):
             writer.writerow({col: r.get(col, "") for col in REPORT_COLUMNS})
 
 
-def write_xlsx_report(rows, path):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "GAID Update Report"
+REPORT_COLUMN_WIDTHS = {
+    "tag_id": 12,
+    "tag_name": 24,
+    "status": 20,
+    "file_resource_status": 38,
+    "old_ip_summary": 60,
+    "new_ip_summary": 60,
+    "ips_added": 40,
+    "ips_removed": 40,
+    "error_message": 44,
+}
+WRAP_COLUMNS = (
+    "file_resource_status",
+    "old_ip_summary",
+    "new_ip_summary",
+    "ips_added",
+    "ips_removed",
+    "error_message",
+)
 
-    ws.append(REPORT_COLUMNS)
+
+def _add_report_sheet(wb, title, rows, columns=None):
+    """Append one styled sheet: bold/frozen header, autofilter, widths."""
+    columns = columns or REPORT_COLUMNS
+    ws = wb.create_sheet(title)
+
+    ws.append(columns)
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
-    wrap_cols = {REPORT_COLUMNS.index(c) + 1 for c in ("old_ip_summary", "new_ip_summary", "ips_added", "ips_removed")}
     for r in rows:
-        ws.append([r.get(col, "") for col in REPORT_COLUMNS])
+        ws.append([r.get(col, "") for col in columns])
+
+    wrap_idx = {columns.index(c) + 1 for c in WRAP_COLUMNS if c in columns}
     for row in range(2, ws.max_row + 1):
-        for col in wrap_cols:
+        for col in wrap_idx:
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(REPORT_COLUMNS))}{ws.max_row}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{ws.max_row}"
+    for idx, col in enumerate(columns, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = REPORT_COLUMN_WIDTHS.get(col, 15)
+    return ws
 
-    widths = {
-        "tag_id": 12,
-        "tag_name": 24,
-        "status": 20,
-        "old_ip_summary": 50,
-        "new_ip_summary": 50,
-        "ips_added": 35,
-        "ips_removed": 35,
-        "error_message": 40,
+
+def _split_rows_by_bucket(rows):
+    """Split the flat report into the sheets a reviewer actually works from.
+
+    Dry-run rows are split by whether there is a real address-level diff,
+    because "matched and already correct" and "matched and will change" are
+    completely different review tasks.
+    """
+    dry = [r for r in rows if r["status"] == "dry-run-update"]
+    return {
+        "Would Update": [r for r in dry if r.get("ips_added") or r.get("ips_removed")],
+        "No Change": [r for r in dry if not (r.get("ips_added") or r.get("ips_removed"))],
+        "Would Convert": [r for r in rows if r["status"] == "dry-run-convert"],
+        "Would Create": [r for r in rows if r["status"] == "dry-run-create"],
+        "Would Delete": [r for r in rows if r["status"] == "dry-run-delete"],
+        "Updated": [r for r in rows if r["status"] == "updated"],
+        "Converted": [r for r in rows if r["status"] == "converted"],
+        "Created": [r for r in rows if r["status"] == "created"],
+        "Deleted": [r for r in rows if r["status"] == "deleted"],
+        "Skipped NAME_CONTAINS": [r for r in rows if r["status"] == "skipped-name-contains"],
+        "Errors": [r for r in rows if r["status"] == "error"],
+        "Skipped No Match": [r for r in rows if r["status"] == "skipped-no-match"],
+        "Untouched": [r for r in rows if r["status"] == "untouched"],
     }
-    for idx, col in enumerate(REPORT_COLUMNS, start=1):
-        ws.column_dimensions[get_column_letter(idx)].width = widths.get(col, 15)
+
+
+def write_xlsx_report(rows, path, run_meta=None):
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    buckets = _split_rows_by_bucket(rows)
+
+    # --- Summary sheet ---
+    ws = wb.create_sheet("Summary")
+    mode = (run_meta or {}).get("Run mode", "")
+    ws.append([f"Qualys GAID Tag Update - {'Applied' if 'APPLY' in mode else 'Dry Run'} Report"])
+    ws["A1"].font = Font(bold=True, size=14)
+    ws.append([])
+
+    for key, value in (run_meta or {}).items():
+        ws.append([key, value])
+    ws.append([])
+
+    ws.append(["Outcome", "Tags", "What it means"])
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+
+    explanations = {
+        "Would Update": "Matched a live tag; IP set differs -> would be rewritten on --apply",
+        "No Change": "Matched a live tag; IP set already identical -> no API call needed",
+        "Would Convert": (
+            "Static tag with IPs in the file -> would become a dynamic "
+            "NETWORK_RANGE tag on --apply"
+        ),
+        "Converted": "Static tag converted in place to dynamic NETWORK_RANGE and verified",
+        "Skipped NAME_CONTAINS": (
+            "Hostname-pattern tag -- never updated by policy; existing rule left intact"
+        ),
+        "Would Create": "GAID in file has no tag in tenant -> would be created on --apply",
+        "Would Delete": (
+            "GAID absent from file entirely -> would be DELETED "
+            "(needs --apply --allow-delete)"
+        ),
+        "Updated": "Rewritten in place in Qualys and verified by read-back",
+        "Created": "Newly created in Qualys and verified by read-back",
+        "Deleted": "Permanently deleted from Qualys and verified gone",
+        "Errors": "Refused: unexpected ruleType or malformed IP content; never written",
+        "Skipped No Match": "GAID in file but no valid IPs; no empty tag created",
+        "Untouched": "GAID is in the file but contributed no IPs; left alone",
+    }
+    for name, bucket_rows in buckets.items():
+        if not bucket_rows:
+            continue
+        ws.append([name, len(bucket_rows), explanations.get(name, "")])
+
+    ws.append([])
+    ws.append(["Total rows", len(rows)])
+    ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 12
+    ws.column_dimensions["C"].width = 76
+
+    # --- One sheet per non-empty outcome, then the full flat report ---
+    for name, bucket_rows in buckets.items():
+        if not bucket_rows:
+            continue
+        _add_report_sheet(wb, name, bucket_rows)
+
+    _add_report_sheet(wb, "All Rows", rows)
 
     wb.save(path)
 
@@ -562,16 +930,48 @@ def parse_args():
         action="store_true",
         help="Actually write changes to Qualys. Without this flag, runs as a dry-run.",
     )
+    parser.add_argument(
+        "--allow-delete",
+        action="store_true",
+        help=(
+            "Permit deletion of GAID tags whose GAID is absent from the file. "
+            "Requires --apply. Deletion is irreversible and detaches the tag "
+            "from every asset it is applied to, so it is opt-in separately."
+        ),
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
+    if args.allow_delete and not args.apply:
+        print("NOTE: --allow-delete has no effect without --apply; this is still a dry run.")
+
     print(f"=== Discovery: {args.excel_path} ===")
-    _, _, rows, gaid_col, ip_col = discover_excel(args.excel_path)
-    raw_by_gaid = build_gaid_ip_map(rows, gaid_col, ip_col)
-    print(f"Found {len(raw_by_gaid)} distinct GAID(s) in the Excel file.")
+    _, _, rows, gaid_col, ip_col, status_col, asset_col = discover_excel(args.excel_path)
+    raw_by_gaid, excluded_rows, excluded_tokens, fully_filtered_gaids = build_gaid_ip_map(
+        rows, gaid_col, ip_col, status_col
+    )
+    all_gaids_in_file, asset_by_gaid = collect_file_gaids(rows, gaid_col, asset_col)
+    status_summary_by_gaid = build_status_summary(rows, gaid_col, ip_col, status_col)
+    decommissioned_gaids = find_decommissioned_gaids(rows, gaid_col, status_col)
+    print(
+        f"Found {len(all_gaids_in_file)} distinct GAID(s) in the file "
+        f"({len(raw_by_gaid)} of them contribute IPs)."
+    )
+    if status_col is not None:
+        print(
+            f"Excluded {excluded_rows} row(s) ({excluded_tokens} IP token(s)) "
+            "for not being in an included resource status."
+        )
+        if fully_filtered_gaids:
+            print(
+                f"NOTE: {len(fully_filtered_gaids)} GAID(s) had IP rows in the "
+                "file but ALL were filtered out by resource status, so they "
+                "carry zero IPs and are treated as 'untouched' (not cleared): "
+                + ", ".join(f"{GAID_TAG_PREFIX}{g}" for g in sorted(fully_filtered_gaids))
+            )
     print()
 
     username, password = load_credentials()
@@ -586,6 +986,38 @@ def main():
         t["tag_name"]: t for t in all_tags if t["tag_name"].startswith(GAID_TAG_PREFIX)
     }
     print(f"Found {len(gaid_tags_by_name)} existing '{GAID_TAG_PREFIX}*' tags in the tenant.")
+
+    run_meta = {
+        "Run mode": "APPLY (writes to Qualys)" if args.apply else "DRY RUN (no writes)",
+        "Run at (UTC)": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
+        "Source file": os.path.basename(args.excel_path),
+        "Qualys pod": BASE_URL,
+        "Tag name format": f"{GAID_TAG_PREFIX}<number>",
+        "Parent tag": GAID_PARENT_TAG_NAME,
+        "Expected ruleType": EXPECTED_RULE_TYPE,
+        "Never updated (ruleType)": ", ".join(sorted(NEVER_UPDATE_RULE_TYPES)),
+        "Static tags": "converted to dynamic NETWORK_RANGE when the file has IPs, else untouched",
+        "Resource status filter": (
+            ", ".join(sorted(INCLUDE_RESOURCE_STATUSES)) if status_col is not None else "(none)"
+        ),
+        "Deletion enabled": "YES (--allow-delete)" if args.allow_delete else "no",
+        "Deletes when": (
+            "GAID absent from file, OR every row for the GAID is "
+            f"{'/'.join(sorted(DELETE_ON_RESOURCE_STATUSES))}"
+        ),
+        "GAIDs fully out of service in file": len(decommissioned_gaids),
+        "Missing tags are created": "yes",
+        "New tag description format": NEW_TAG_DESCRIPTION_TEMPLATE,
+        "GAIDs in file (total)": len(all_gaids_in_file),
+        "GAIDs in file (with IPs)": len(raw_by_gaid),
+        "Rows excluded by status filter": excluded_rows,
+        "IP tokens excluded by status filter": excluded_tokens,
+        "GAIDs fully filtered out (left untouched)": len(fully_filtered_gaids),
+        "Tags fetched from tenant": len(all_tags),
+        "Existing GAID tags in tenant": len(gaid_tags_by_name),
+    }
 
     non_network_range = [
         t for t in gaid_tags_by_name.values() if t["rule_type"] != EXPECTED_RULE_TYPE
@@ -607,16 +1039,52 @@ def main():
 
         tag = gaid_tags_by_name.get(expected_name)
         if tag is None:
+            # In the file but not in the tenant -> create it.
+            if invalid_tokens:
+                report_rows.append(
+                    {
+                        "tag_id": "",
+                        "tag_name": expected_name,
+                        "status": "error",
+                        "old_ip_summary": "",
+                        "new_ip_summary": "",
+                        "ips_added": "",
+                        "ips_removed": "",
+                        "error_message": "invalid IP/range entries: " + ", ".join(invalid_tokens),
+                    }
+                )
+                continue
+            if not new_ips:
+                report_rows.append(
+                    {
+                        "tag_id": "",
+                        "tag_name": expected_name,
+                        "status": "skipped-no-match",
+                        "old_ip_summary": "",
+                        "new_ip_summary": "",
+                        "ips_added": "",
+                        "ips_removed": "",
+                        "error_message": "no valid IPs in file; not creating an empty tag",
+                    }
+                )
+                continue
+
+            asset = asset_by_gaid.get(gaid_key, "")
+            description = (
+                NEW_TAG_DESCRIPTION_TEMPLATE.format(asset=asset, gaid=gaid_key) if asset else ""
+            )
             report_rows.append(
                 {
                     "tag_id": "",
                     "tag_name": expected_name,
-                    "status": "skipped-no-match",
+                    "status": "create" if args.apply else "dry-run-create",
                     "old_ip_summary": "",
                     "new_ip_summary": ", ".join(new_ips),
-                    "ips_added": "",
+                    "ips_added": ", ".join(new_ips),
                     "ips_removed": "",
-                    "error_message": "no matching tag in tenant",
+                    "error_message": "",
+                    "_new_ips": new_ips,
+                    "_description": description,
                 }
             )
             continue
@@ -638,7 +1106,32 @@ def main():
             )
             continue
 
-        if tag["rule_type"] != EXPECTED_RULE_TYPE:
+        rule_type = tag["rule_type"]
+
+        # Hostname-pattern tags are never touched.
+        if rule_type in NEVER_UPDATE_RULE_TYPES:
+            report_rows.append(
+                {
+                    "tag_id": tag["tag_id"],
+                    "tag_name": expected_name,
+                    "status": "skipped-name-contains",
+                    "old_ip_summary": tag["rule_text"],
+                    "new_ip_summary": ", ".join(new_ips),
+                    "ips_added": "",
+                    "ips_removed": "",
+                    "error_message": (
+                        f"ruleType {rule_type!r} is never updated by policy; "
+                        "its existing rule is left intact"
+                    ),
+                }
+            )
+            continue
+
+        is_conversion = rule_type in STATIC_RULE_TYPES
+
+        # Anything that is neither a network-range tag nor a static tag
+        # awaiting conversion is refused rather than guessed at.
+        if not is_conversion and rule_type != EXPECTED_RULE_TYPE:
             report_rows.append(
                 {
                     "tag_id": tag["tag_id"],
@@ -648,7 +1141,7 @@ def main():
                     "new_ip_summary": ", ".join(new_ips),
                     "ips_added": "",
                     "ips_removed": "",
-                    "error_message": f"unexpected ruleType {tag['rule_type']!r}, expected {EXPECTED_RULE_TYPE!r}",
+                    "error_message": f"unexpected ruleType {rule_type!r}, expected {EXPECTED_RULE_TYPE!r}",
                 }
             )
             continue
@@ -659,43 +1152,99 @@ def main():
         added = sorted(new_set - old_set, key=lambda c: new_ips.index(c) if c in new_ips else 0)
         removed = sorted(old_set - new_set, key=lambda c: old_ips.index(c) if c in old_ips else 0)
 
+        if args.apply:
+            row_status = "pending"
+        elif is_conversion:
+            row_status = "dry-run-convert"
+        else:
+            row_status = "dry-run-update"
+
         report_rows.append(
             {
                 "tag_id": tag["tag_id"],
                 "tag_name": expected_name,
-                "status": "dry-run" if not args.apply else "pending",
+                "status": row_status,
                 "old_ip_summary": ", ".join(old_ips),
                 "new_ip_summary": ", ".join(new_ips),
                 "ips_added": ", ".join(added),
                 "ips_removed": ", ".join(removed),
-                "error_message": "",
+                "error_message": (
+                    f"static tag -> converting to dynamic {EXPECTED_RULE_TYPE}"
+                    if is_conversion
+                    else ""
+                ),
                 "_new_ips": new_ips,
-                "_has_diff": old_set != new_set,
+                # A static tag has no rule at all, so converting it always
+                # counts as a change even though there is nothing to diff.
+                "_has_diff": old_set != new_set or is_conversion,
+                "_is_conversion": is_conversion,
                 "_tag": tag,
             }
         )
 
     for name, tag in gaid_tags_by_name.items():
-        if name not in matched_names:
-            old_ips, _ = parse_qualys_rule_text(tag["rule_text"])
+        if name in matched_names:
+            continue
+
+        old_ips, _ = parse_qualys_rule_text(tag["rule_text"])
+        gaid_key = name[len(GAID_TAG_PREFIX):]
+
+        # Two independent reasons to delete: the GAID is nowhere in the file,
+        # or it is in the file but every one of its resources is out of
+        # service. A GAID that is in the file and still has live resources is
+        # never a deletion candidate, even if it contributed no IPs.
+        delete_reason = ""
+        if gaid_key not in all_gaids_in_file:
+            delete_reason = "GAID absent from file"
+        elif gaid_key in decommissioned_gaids:
+            delete_reason = "all resources Out of Service in file"
+
+        if delete_reason:
             report_rows.append(
                 {
                     "tag_id": tag["tag_id"],
                     "tag_name": name,
-                    "status": "untouched",
+                    "status": "delete" if args.apply else "dry-run-delete",
                     "old_ip_summary": ", ".join(old_ips),
                     "new_ip_summary": "",
                     "ips_added": "",
-                    "ips_removed": "",
-                    "error_message": "not in file",
+                    "ips_removed": ", ".join(old_ips),
+                    "error_message": delete_reason,
+                    "_tag": tag,
                 }
             )
+            continue
+
+        note = (
+            "in file with live resources, but all IP-bearing rows are out of service"
+            if gaid_key in fully_filtered_gaids
+            else "in file, but no IP rows to apply"
+        )
+        report_rows.append(
+            {
+                "tag_id": tag["tag_id"],
+                "tag_name": name,
+                "status": "untouched",
+                "old_ip_summary": ", ".join(old_ips),
+                "new_ip_summary": "",
+                "ips_added": "",
+                "ips_removed": "",
+                "error_message": note,
+            }
+        )
+
+    # Annotate every row with the file's resource-status breakdown for that
+    # GAID, so a reviewer can see at a glance whether an IP change (or a
+    # GAID being untouched) is explained by resources going out of service.
+    for r in report_rows:
+        gaid_key = r["tag_name"][len(GAID_TAG_PREFIX):]
+        r["file_resource_status"] = status_summary_by_gaid.get(gaid_key, "")
 
     # --- dry-run: print plan and exit ---
     if not args.apply:
         print("=== DRY RUN: no changes will be written. Pass --apply to write. ===")
         print_action_plan(report_rows)
-        write_reports(report_rows)
+        write_reports(report_rows, run_meta)
         print_summary(report_rows, applied=False)
         return
 
@@ -705,16 +1254,62 @@ def main():
     for r in no_op:
         r["status"] = "updated"
 
-    if to_update:
+    to_create = [r for r in report_rows if r["status"] == "create"]
+    to_delete = [r for r in report_rows if r["status"] == "delete"]
+
+    # Deleting is irreversible and detaches the tag from every asset it is
+    # applied to, so it needs its own opt-in on top of --apply.
+    if to_delete and not args.allow_delete:
+        for r in to_delete:
+            r["status"] = "untouched"
+            r["ips_removed"] = ""
+            r["error_message"] = (
+                "GAID absent from file; deletion skipped (pass --allow-delete to delete)"
+            )
+        print(
+            f"NOTE: {len(to_delete)} tag(s) qualify for deletion but --allow-delete "
+            "was not passed; they were left untouched."
+        )
+        to_delete = []
+
+    # Back up everything that is about to be modified or destroyed, before
+    # the first write call.
+    touched_tags = [r["_tag"] for r in to_update] + [r["_tag"] for r in to_delete]
+    if touched_tags:
         timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        touched_tags = [r["_tag"] for r in to_update]
         write_backup(touched_tags, timestamp)
 
-    print(f"=== APPLYING: {len(to_update)} tag(s) will be updated ===")
+    parent_tag_id = ""
+    if to_create:
+        parent_tag = next(
+            (t for t in all_tags if t["tag_name"] == GAID_PARENT_TAG_NAME), None
+        )
+        if parent_tag is None:
+            raise RuntimeError(
+                f"Cannot create tags: parent tag {GAID_PARENT_TAG_NAME!r} not found in tenant"
+            )
+        parent_tag_id = parent_tag["tag_id"]
+        print(f"Parent tag for new tags: {GAID_PARENT_TAG_NAME!r} (id {parent_tag_id})")
+
+    print(
+        f"=== APPLYING: {len(to_update)} update(s), {len(to_create)} create(s), "
+        f"{len(to_delete)} delete(s) ==="
+    )
     for r in to_update:
         apply_one_update(session, r)
+    for r in to_create:
+        apply_one_create(session, r, parent_tag_id)
+    # Recomputed from the same inputs that classified each row, so the
+    # pre-delete guard re-checks the decision rather than trusting the row.
+    deletable_gaids = decommissioned_gaids | {
+        r["tag_name"][len(GAID_TAG_PREFIX):]
+        for r in to_delete
+        if r["tag_name"][len(GAID_TAG_PREFIX):] not in all_gaids_in_file
+    }
+    for r in to_delete:
+        apply_one_delete(session, r, deletable_gaids)
 
-    write_reports(report_rows)
+    write_reports(report_rows, run_meta)
     print_summary(report_rows, applied=True)
 
 
@@ -737,7 +1332,7 @@ def apply_one_update(session, row):
     xml_body = (
         "<ServiceRequest><data><Tag>"
         f"<ruleType>{EXPECTED_RULE_TYPE}</ruleType>"
-        f"<ruleText>{new_rule_text}</ruleText>"
+        f"<ruleText>{xml_escape(new_rule_text)}</ruleText>"
         "</Tag></data></ServiceRequest>"
     )
 
@@ -769,50 +1364,210 @@ def apply_one_update(session, row):
         )
         return
 
-    row["status"] = "updated"
+    # The tag must end up dynamic/NETWORK_RANGE -- this is the only check
+    # that proves a static tag actually converted rather than silently
+    # keeping its old form.
+    if verify_tag["rule_type"] != EXPECTED_RULE_TYPE:
+        row["status"] = "error"
+        row["error_message"] = (
+            "post-update verification failed: ruleType is "
+            f"{verify_tag['rule_type']!r}, expected {EXPECTED_RULE_TYPE!r}"
+        )
+        return
+
+    row["status"] = "converted" if row.get("_is_conversion") else "updated"
+
+
+def build_create_xml(name, parent_tag_id, rule_text, description):
+    parts = [
+        f"<name>{xml_escape(name)}</name>",
+        f"<parentTagId>{xml_escape(str(parent_tag_id))}</parentTagId>",
+        f"<ruleType>{EXPECTED_RULE_TYPE}</ruleType>",
+        f"<ruleText>{xml_escape(rule_text)}</ruleText>",
+    ]
+    if NEW_TAG_COLOR:
+        parts.append(f"<color>{xml_escape(NEW_TAG_COLOR)}</color>")
+    if description:
+        parts.append(f"<description>{xml_escape(description)}</description>")
+    return "<ServiceRequest><data><Tag>" + "".join(parts) + "</Tag></data></ServiceRequest>"
+
+
+def apply_one_create(session, row, parent_tag_id):
+    """Create a missing GAID tag, then read it back and verify its IP set."""
+    name = row["tag_name"]
+    new_ips = row["_new_ips"]
+
+    # Never create a tag that already exists -- a duplicate name would make
+    # subsequent runs ambiguous about which id to update.
+    existing = fetch_tag_by_name(session, name)
+    if existing is not None:
+        row["status"] = "error"
+        row["error_message"] = (
+            f"aborted: tag {name!r} already exists (id {existing['tag_id']}) -- not creating a duplicate"
+        )
+        return
+
+    xml_body = build_create_xml(name, parent_tag_id, ",".join(new_ips), row.get("_description", ""))
+
+    try:
+        request_with_retry(session, "POST", TAG_CREATE_URL, xml_body, f"create tag {name!r}")
+    except RuntimeError as exc:
+        row["status"] = "error"
+        row["error_message"] = str(exc)
+        return
+
+    verify_tag = fetch_tag_by_name(session, name)
+    if verify_tag is None:
+        row["status"] = "error"
+        row["error_message"] = "create call succeeded but tag not found on read-back"
+        return
+
+    stored_ips, _ = parse_qualys_rule_text(verify_tag["rule_text"])
+    if set(stored_ips) != set(new_ips):
+        row["status"] = "error"
+        row["error_message"] = (
+            "post-create verification failed: stored IPs do not match intended set "
+            f"(stored={stored_ips!r}, expected={new_ips!r})"
+        )
+        return
+
+    row["tag_id"] = verify_tag["tag_id"]
+    row["status"] = "created"
+
+
+def apply_one_delete(session, row, deletable_gaids):
+    """Delete a GAID tag that the file says should no longer exist.
+
+    Deletion is irreversible and detaches the tag from every asset it is
+    applied to, so the target is re-verified against live state immediately
+    before the call: the id must still carry the expected name, and that
+    name's GAID must still be in the approved deletion set.
+    """
+    tag_id = row["tag_id"]
+    expected_name = row["tag_name"]
+
+    live_tag = fetch_tag_by_id(session, tag_id)
+    if live_tag is None:
+        row["status"] = "error"
+        row["error_message"] = "aborted: tag not found immediately before delete"
+        return
+    if live_tag["tag_name"] != expected_name:
+        row["status"] = "error"
+        row["error_message"] = (
+            f"aborted: id {tag_id} now carries name {live_tag['tag_name']!r}, "
+            f"expected {expected_name!r}"
+        )
+        return
+
+    gaid_key = expected_name[len(GAID_TAG_PREFIX):]
+    if gaid_key not in deletable_gaids:
+        row["status"] = "error"
+        row["error_message"] = (
+            f"aborted: GAID {gaid_key} is no longer an approved deletion candidate"
+        )
+        return
+
+    try:
+        request_with_retry(
+            session,
+            "POST",
+            TAG_DELETE_URL.format(tag_id=tag_id),
+            "<ServiceRequest></ServiceRequest>",
+            f"delete tag {tag_id}",
+        )
+    except RuntimeError as exc:
+        row["status"] = "error"
+        row["error_message"] = str(exc)
+        return
+
+    if fetch_tag_by_id(session, tag_id) is not None:
+        row["status"] = "error"
+        row["error_message"] = "delete call succeeded but tag still present on read-back"
+        return
+
+    row["status"] = "deleted"
 
 
 def print_action_plan(report_rows):
     for r in report_rows:
-        if r["status"] not in ("dry-run",):
-            continue
-        if not r.get("_has_diff"):
-            print(f"  [no change] {r['tag_name']} (id {r['tag_id']}) already matches file")
-            continue
-        print(f"  [would update] {r['tag_name']} (id {r['tag_id']})")
-        print(f"      + added:   {r['ips_added'] or '(none)'}")
-        print(f"      - removed: {r['ips_removed'] or '(none)'}")
+        status = r["status"]
+        if status == "dry-run-update":
+            if not r.get("_has_diff"):
+                print(f"  [no change] {r['tag_name']} (id {r['tag_id']}) already matches file")
+                continue
+            print(f"  [would update] {r['tag_name']} (id {r['tag_id']})")
+            print(f"      + added:   {r['ips_added'] or '(none)'}")
+            print(f"      - removed: {r['ips_removed'] or '(none)'}")
+        elif status == "dry-run-convert":
+            print(f"  [would CONVERT to dynamic] {r['tag_name']} (id {r['tag_id']})")
+            print(f"      static tag -> {EXPECTED_RULE_TYPE} with: {r['new_ip_summary']}")
+        elif status == "dry-run-create":
+            print(f"  [would CREATE] {r['tag_name']}")
+            print(f"      description: {r.get('_description', '') or '(none)'}")
+            print(f"      IPs: {r['new_ip_summary']}")
+        elif status == "dry-run-delete":
+            print(f"  [would DELETE] {r['tag_name']} (id {r['tag_id']}) - GAID absent from file")
+            print(f"      current IPs: {r['old_ip_summary'] or '(none)'}")
     print()
 
 
-def write_reports(report_rows):
+def _write_with_fallback(writer, path):
+    """Write, falling back to a timestamped name if the file is locked.
+
+    On Windows the previous report is often still open in Excel, which holds
+    an exclusive lock. Losing a completed run's output to that would be
+    daft, so write beside it instead.
+    """
+    try:
+        writer(path)
+        return path
+    except PermissionError:
+        stem, ext = os.path.splitext(path)
+        stamp = datetime.datetime.now().strftime("%H%M%S")
+        alt = f"{stem}_{stamp}{ext}"
+        writer(alt)
+        print(f"NOTE: {path} was locked (open in another program); wrote {alt} instead.")
+        return alt
+
+
+def write_reports(report_rows, run_meta=None):
     today = datetime.date.today().isoformat()
-    csv_path = f"gaid_update_report_{today}.csv"
-    xlsx_path = f"gaid_update_report_{today}.xlsx"
     clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in report_rows]
-    write_csv_report(clean_rows, csv_path)
-    write_xlsx_report(clean_rows, xlsx_path)
+
+    csv_path = _write_with_fallback(
+        lambda p: write_csv_report(clean_rows, p), f"gaid_update_report_{today}.csv"
+    )
+    xlsx_path = _write_with_fallback(
+        lambda p: write_xlsx_report(clean_rows, p, run_meta), f"gaid_update_report_{today}.xlsx"
+    )
     print(f"Wrote {csv_path}")
     print(f"Wrote {xlsx_path}")
 
 
 def print_summary(report_rows, applied):
-    total = len(report_rows)
-    updated = sum(1 for r in report_rows if r["status"] == "updated")
-    dry_run = sum(1 for r in report_rows if r["status"] == "dry-run")
-    skipped = sum(1 for r in report_rows if r["status"] == "skipped-no-match")
-    untouched = sum(1 for r in report_rows if r["status"] == "untouched")
-    failed = sum(1 for r in report_rows if r["status"] == "error")
+    count = lambda s: sum(1 for r in report_rows if r["status"] == s)
+    dry_run_rows = [r for r in report_rows if r["status"] == "dry-run-update"]
+    dry_run_real_diff = sum(1 for r in dry_run_rows if r.get("ips_added") or r.get("ips_removed"))
 
     print()
     print("=== Summary ===")
-    print(f"Mode:                  {'APPLY' if applied else 'DRY-RUN'}")
-    print(f"Total rows:            {total}")
-    print(f"Updated:               {updated}")
-    print(f"Dry-run (would update):{dry_run}")
-    print(f"Skipped (no match):    {skipped}")
-    print(f"Untouched (not in file):{untouched}")
-    print(f"Failed:                {failed}")
+    print(f"Mode:                     {'APPLY' if applied else 'DRY-RUN'}")
+    print(f"Total rows:               {len(report_rows)}")
+    if applied:
+        print(f"Updated:                  {count('updated')}")
+        print(f"Converted to dynamic:     {count('converted')}")
+        print(f"Created:                  {count('created')}")
+        print(f"Deleted:                  {count('deleted')}")
+    else:
+        print(f"Would update (real diff): {dry_run_real_diff}")
+        print(f"Matched, no change:       {len(dry_run_rows) - dry_run_real_diff}")
+        print(f"Would convert to dynamic: {count('dry-run-convert')}")
+        print(f"Would create:             {count('dry-run-create')}")
+        print(f"Would DELETE:             {count('dry-run-delete')}")
+    print(f"Skipped NAME_CONTAINS:    {count('skipped-name-contains')}")
+    print(f"Skipped (no valid IPs):   {count('skipped-no-match')}")
+    print(f"Untouched (in file, no IPs): {count('untouched')}")
+    print(f"Failed:                   {count('error')}")
 
 
 if __name__ == "__main__":
