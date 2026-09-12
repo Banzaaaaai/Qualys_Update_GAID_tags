@@ -997,6 +997,10 @@ def main():
     args.apply = not args.dry_run
     args.allow_delete = not args.dry_run
 
+    # One timestamp per run, shared by this run's backup and its report so
+    # the two files are trivially paired after the fact.
+    run_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
     if args.apply:
         print("*" * 72)
         print("REAL RUN - changes WILL be written to Qualys, including DELETIONS.")
@@ -1353,7 +1357,7 @@ def main():
     if not args.apply:
         print("=== DRY RUN: no changes will be written. Omit --dry-run for the real run. ===")
         print_action_plan(report_rows)
-        write_reports(report_rows, run_meta)
+        write_reports(report_rows, run_meta, applied=False, run_timestamp=run_timestamp)
         print_summary(report_rows, applied=False)
         return
 
@@ -1385,8 +1389,7 @@ def main():
     # the first write call.
     touched_tags = [r["_tag"] for r in to_update] + [r["_tag"] for r in to_delete]
     if touched_tags:
-        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        write_backup(touched_tags, timestamp)
+        write_backup(touched_tags, run_timestamp)
 
     parent_tag_id = ""
     if to_create:
@@ -1418,7 +1421,7 @@ def main():
     for r in to_delete:
         apply_one_delete(session, r, deletable_gaids)
 
-    write_reports(report_rows, run_meta)
+    write_reports(report_rows, run_meta, applied=True, run_timestamp=run_timestamp)
     print_summary(report_rows, applied=True)
 
 
@@ -1639,15 +1642,25 @@ def _write_with_fallback(writer, path):
         return alt
 
 
-def write_reports(report_rows, run_meta=None):
-    today = datetime.date.today().isoformat()
+def write_reports(report_rows, run_meta=None, applied=False, run_timestamp=None):
+    """Write the change report.
+
+    A real run's report is stamped with that run's UTC timestamp -- the same
+    one as its backup, so the pair is obvious -- and therefore can never be
+    overwritten by a later run. It is the only record of what was changed,
+    and changes here are irreversible. A dry-run report is just a preview, so
+    it keeps the plain dated name and is allowed to be replaced.
+    """
+    if applied:
+        stem = f"gaid_update_report_{run_timestamp}_applied"
+    else:
+        stem = f"gaid_update_report_{datetime.date.today().isoformat()}"
+
     clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in report_rows]
 
-    csv_path = _write_with_fallback(
-        lambda p: write_csv_report(clean_rows, p), f"gaid_update_report_{today}.csv"
-    )
+    csv_path = _write_with_fallback(lambda p: write_csv_report(clean_rows, p), f"{stem}.csv")
     xlsx_path = _write_with_fallback(
-        lambda p: write_xlsx_report(clean_rows, p, run_meta), f"gaid_update_report_{today}.xlsx"
+        lambda p: write_xlsx_report(clean_rows, p, run_meta), f"{stem}.xlsx"
     )
     print(f"Wrote {csv_path}")
     print(f"Wrote {xlsx_path}")

@@ -293,9 +293,15 @@ observed afterwards via each tag's `reEvalStatus` field.
 
 ### Change report
 
-Written every run as `gaid_update_report_<date>.csv` and `.xlsx`. If the
-target file is locked (typically open in Excel), the script writes to a
-timestamped name beside it rather than losing the run.
+- **Real run:** `gaid_update_report_<UTC timestamp>_applied.csv` / `.xlsx`,
+  stamped with the same timestamp as that run's backup so the pair is
+  obvious. Because the name is unique per run, **a later run can never
+  overwrite it** — it is the only record of what was changed, and the
+  changes are irreversible.
+- **Dry run:** `gaid_update_report_<date>.csv` / `.xlsx`. A preview is
+  disposable, so this one is replaced each time.
+- If the target file is locked (typically open in Excel), the script writes
+  to a timestamped name beside it rather than losing the run.
 
 - **CSV** — one flat row per GAID.
 - **XLSX** — `Summary` (run metadata, rules in force, outcome counts with
