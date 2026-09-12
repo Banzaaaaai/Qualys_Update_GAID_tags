@@ -150,7 +150,10 @@ Each GAID is matched to the Qualys tag named exactly
   - `parentTagId` = id of `[VFZ] Global Application Inventory`, resolved by
     name at runtime
   - `ruleType` = `NETWORK_RANGE`, `ruleText` = the file's IP set
-  - `color` = `#FF` (`NEW_TAG_COLOR`; set to `""` to omit)
+  - `color` — omitted by default. Existing GAID tags store `#FF`, but the
+    live XSD restricts color to `#RGB`/`#RRGGBB`, so echoing `#FF` back
+    would be rejected. Set `NEW_TAG_COLOR` to a valid 3- or 6-digit hex
+    value if new tags should have a specific color.
   - `description` = `<ASSET> (GAID: <n>)`, mirroring existing tags such as
     `Toolbox (GAID: 1356)`
 - A GAID with no valid IPs is **never created as an empty tag** — reported
@@ -215,6 +218,28 @@ Important qualifications:
 | other (e.g. `CLOUD_ASSET`) | yes | Refused as `error` |
 
 ---
+
+## Rule evaluation ("Evaluate Rule on Creation")
+
+The UI checkbox has **no API equivalent, and none is needed** — Qualys does
+it automatically for exactly the operations this script performs.
+
+- The live `tag.xsd` on this pod has no settable evaluation field. It
+  exposes only the read-only `reEvalStatus` and `reEvalStatusProgress`.
+- The 392-page *Asset Management & Tagging API v2* guide contains no
+  `reevaluateTagOnUpdate` / "evaluate rule" request parameter anywhere.
+- The old explicit endpoint, `POST /qps/rest/2.0/evaluate/am/tag/<id>`, is
+  **deprecated** and now returns `INVALID_REQUEST`:
+
+  > "The Evaluate Tag API is now deprecated... now tags are automatically
+  > queued for evaluation when their dynamic rule is updated or a new
+  > dynamic tag is created."
+
+So an updated `ruleText`, a static→dynamic conversion, and a newly created
+dynamic tag are each queued for evaluation by the platform on write. Adding
+an evaluation element to the request body would not enable anything; it
+would risk the whole payload being rejected as invalid XML. Progress can be
+observed afterwards via each tag's `reEvalStatus` field.
 
 ## Verification, backups and safety
 

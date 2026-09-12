@@ -81,11 +81,18 @@ NEVER_UPDATE_RULE_TYPES = {"NAME_CONTAINS"}
 STATIC_RULE_TYPES = {"", "STATIC"}
 
 # Attributes given to newly created GAID tags, mirroring the convention of
-# tags that already exist in the tenant (e.g. "Toolbox (GAID: 1356)",
-# color "#FF"). The parent tag id is resolved at runtime by looking up
-# GAID_PARENT_TAG_NAME, so it is never hardcoded/stale. Set NEW_TAG_COLOR to
-# "" to omit the color element entirely.
-NEW_TAG_COLOR = "#FF"
+# tags that already exist in the tenant (e.g. "Toolbox (GAID: 1356)"). The
+# parent tag id is resolved at runtime by looking up GAID_PARENT_TAG_NAME,
+# so it is never hardcoded/stale.
+#
+# Color is deliberately left empty. Existing GAID tags in this tenant store
+# "#FF", but the live tag.xsd restricts color to #RGB or #RRGGBB
+# (pattern "#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?"), so sending "#FF" back would
+# be rejected -- that stored value predates or bypasses validation. Rather
+# than invent a color the tenant never chose, the element is omitted and
+# Qualys applies its own default. Set this to a valid 3- or 6-digit hex
+# value (e.g. "#FFFFFF") if new tags should have a specific color.
+NEW_TAG_COLOR = ""
 NEW_TAG_DESCRIPTION_TEMPLATE = "{asset} (GAID: {gaid})"
 ASSET_NAME_COLUMN_PATTERNS = [r"^\s*asset\s*$", r"asset\s*name", r"application\s*name"]
 
