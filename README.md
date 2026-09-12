@@ -112,6 +112,24 @@ Live rule-type distribution across the 464 GAID tags in the tenant:
 - A range wider than `MAX_RANGE_SIZE` (1,000,000 addresses) is rejected as
   garbage rather than expanded.
 
+### Excluded address blocks
+
+- Addresses in `EXCLUDED_IP_NETWORKS` — `169.254.0.0/16` (link-local/APIPA)
+  and `192.168.0.0/16` (re-used verbatim across sites) — never identify a
+  real asset in this estate and are stripped from the file's IP set.
+- The filter applies to the **file only, never to what Qualys currently
+  holds**. That is deliberate: filtering both sides would mask addresses
+  already stored in a tag and they would never be cleaned up. Leaving the
+  Qualys side unfiltered makes them appear as removals in the diff and they
+  get stripped on the next run.
+- Ranges straddling a block boundary are split, not dropped wholesale —
+  `192.167.255.254-192.168.0.2` keeps `192.167.255.254-192.167.255.255` and
+  drops the rest.
+- The `ips_excluded` report column lists exactly what was stripped per GAID.
+- **A GAID whose addresses are *all* excluded is left untouched, not
+  cleared.** Wiping a tag's scope is a far stronger action than updating it
+  and must never happen as a side effect of this filter.
+
 ---
 
 ## Decision logic
@@ -284,7 +302,7 @@ timestamped name beside it rather than losing the run.
   explanations), one sheet per non-empty outcome, and `All Rows`.
 - Columns: `tag_id`, `tag_name`, `status`, `file_resource_status`,
   `old_ip_summary`, `new_ip_summary`, `ips_added`, `ips_removed`,
-  `error_message`.
+  `ips_excluded`, `error_message`.
 - `file_resource_status` shows the `RESOURCE STATUS` breakdown for that GAID
   across its IP-bearing rows (e.g. `In Service: 50, Out of Service: 1`), so
   every outcome explains itself without cross-referencing the source file.

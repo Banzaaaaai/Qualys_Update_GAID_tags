@@ -18,6 +18,11 @@ WHAT IT DOES (see README.md for the rationale behind each rule):
   * NAME_CONTAINS tags are never written to; other unexpected rule types are
     refused rather than guessed at.
 
+Addresses in 169.254.0.0/16 and 192.168.0.0/16 are stripped from the file's
+IP set (see EXCLUDED_IP_NETWORKS). The filter is applied to the file only,
+never to what Qualys holds, so any such addresses already stored in a tag
+show up as removals and get cleaned out.
+
 HARD CONSTRAINTS:
 1. COMPLETE REPLACEMENT of each GAID tag's IP/range list with the set from
    the Excel file -- never a merge/union with what is currently in Qualys.
@@ -116,6 +121,7 @@ REPORT_COLUMNS = [
     "new_ip_summary",
     "ips_added",
     "ips_removed",
+    "ips_excluded",
     "error_message",
 ]
 
@@ -162,6 +168,18 @@ IP_CELL_SPLIT_RE = re.compile(r"[,;\n\r]+")
 # garbage/typo'd range (e.g. a full /8) can't blow up memory -- real GAID
 # ranges observed in the tenant are at most a few hundred addresses wide.
 MAX_RANGE_SIZE = 1_000_000
+
+# Address blocks that are never scoped into a GAID tag. 169.254.0.0/16 is
+# link-local/APIPA and 192.168.0.0/16 is re-used verbatim across sites, so
+# neither identifies a real asset in this estate. Addresses in these blocks
+# are stripped from the file's IP set; they are NOT stripped from what
+# Qualys currently holds, so any that are already stored show up as
+# removals in the diff and get cleaned out on the next run.
+EXCLUDED_IP_NETWORKS = ("169.254.0.0/16", "192.168.0.0/16")
+_EXCLUDED_IP_RANGES = tuple(
+    (int(net.network_address), int(net.broadcast_address))
+    for net in (ipaddress.IPv4Network(c) for c in EXCLUDED_IP_NETWORKS)
+)
 
 
 # --------------------------------------------------------------------------
@@ -482,6 +500,25 @@ def normalize_ip_set(raw_tokens):
     return ordered, invalid
 
 
+def drop_excluded_networks(entries):
+    """Strip addresses in EXCLUDED_IP_NETWORKS from canonical IP entries.
+
+    Applied to the file's IP set only -- never to what Qualys currently
+    holds, so addresses already stored in a tag surface as removals in the
+    diff instead of being masked on both sides.
+
+    Returns (kept_entries, dropped_entries), both recompacted.
+    """
+    kept, dropped = set(), set()
+    for entry in entries:
+        for addr in expand_entry_to_ints(entry):
+            if any(lo <= addr <= hi for lo, hi in _EXCLUDED_IP_RANGES):
+                dropped.add(addr)
+            else:
+                kept.add(addr)
+    return compact_ints_to_entries(kept), compact_ints_to_entries(dropped)
+
+
 def parse_qualys_rule_text(rule_text):
     tokens = IP_CELL_SPLIT_RE.split(rule_text) if rule_text else []
     ordered, invalid = normalize_ip_set(tokens)
@@ -795,6 +832,7 @@ REPORT_COLUMN_WIDTHS = {
     "new_ip_summary": 60,
     "ips_added": 40,
     "ips_removed": 40,
+    "ips_excluded": 40,
     "error_message": 44,
 }
 WRAP_COLUMNS = (
@@ -803,6 +841,7 @@ WRAP_COLUMNS = (
     "new_ip_summary",
     "ips_added",
     "ips_removed",
+    "ips_excluded",
     "error_message",
 )
 
@@ -1017,6 +1056,7 @@ def main():
         "Expected ruleType": EXPECTED_RULE_TYPE,
         "Never updated (ruleType)": ", ".join(sorted(NEVER_UPDATE_RULE_TYPES)),
         "Static tags": "converted to dynamic NETWORK_RANGE when the file has IPs, else untouched",
+        "Excluded IP blocks": ", ".join(EXCLUDED_IP_NETWORKS),
         "Resource status filter": (
             ", ".join(sorted(INCLUDE_RESOURCE_STATUSES)) if status_col is not None else "(none)"
         ),
@@ -1051,9 +1091,18 @@ def main():
     report_rows = []
     matched_names = set()
 
+    excluded_ip_total = 0
+    gaids_emptied_by_exclusion = set()
+
     for gaid_key, raw_tokens in sorted(raw_by_gaid.items(), key=lambda kv: (len(kv[0]), kv[0])):
         expected_name = f"{GAID_TAG_PREFIX}{gaid_key}"
         new_ips, invalid_tokens = normalize_ip_set(raw_tokens)
+        had_ips_before_exclusion = bool(new_ips)
+        new_ips, excluded_ips = drop_excluded_networks(new_ips)
+        if excluded_ips:
+            excluded_ip_total += 1
+        if had_ips_before_exclusion and not new_ips:
+            gaids_emptied_by_exclusion.add(gaid_key)
 
         tag = gaid_tags_by_name.get(expected_name)
         if tag is None:
@@ -1100,6 +1149,7 @@ def main():
                     "new_ip_summary": ", ".join(new_ips),
                     "ips_added": ", ".join(new_ips),
                     "ips_removed": "",
+                    "ips_excluded": ", ".join(excluded_ips),
                     "error_message": "",
                     "_new_ips": new_ips,
                     "_description": description,
@@ -1108,6 +1158,31 @@ def main():
             continue
 
         matched_names.add(expected_name)
+
+        # An empty desired set is never written: clearing a tag's scope is a
+        # far stronger action than updating it and must not happen as a side
+        # effect of filtering out irrelevant address blocks.
+        if not new_ips and not invalid_tokens:
+            old_ips, _ = parse_qualys_rule_text(tag["rule_text"])
+            report_rows.append(
+                {
+                    "tag_id": tag["tag_id"],
+                    "tag_name": expected_name,
+                    "status": "untouched",
+                    "old_ip_summary": ", ".join(old_ips),
+                    "new_ip_summary": "",
+                    "ips_added": "",
+                    "ips_removed": "",
+                    "ips_excluded": ", ".join(excluded_ips),
+                    "error_message": (
+                        "all IPs for this GAID are in excluded blocks "
+                        f"({', '.join(EXCLUDED_IP_NETWORKS)}); tag left as-is, not cleared"
+                        if excluded_ips
+                        else "no usable IPs in file; tag left as-is, not cleared"
+                    ),
+                }
+            )
+            continue
 
         if invalid_tokens:
             report_rows.append(
@@ -1186,6 +1261,7 @@ def main():
                 "new_ip_summary": ", ".join(new_ips),
                 "ips_added": ", ".join(added),
                 "ips_removed": ", ".join(removed),
+                "ips_excluded": ", ".join(excluded_ips),
                 "error_message": (
                     f"static tag -> converting to dynamic {EXPECTED_RULE_TYPE}"
                     if is_conversion
@@ -1250,6 +1326,21 @@ def main():
                 "error_message": note,
             }
         )
+
+    if excluded_ip_total:
+        print(
+            f"Excluded IP blocks {', '.join(EXCLUDED_IP_NETWORKS)}: stripped addresses "
+            f"from {excluded_ip_total} GAID(s)."
+        )
+        if gaids_emptied_by_exclusion:
+            print(
+                f"NOTE: {len(gaids_emptied_by_exclusion)} GAID(s) had ALL their IPs in "
+                "excluded blocks; those tags are left as-is, not cleared: "
+                + ", ".join(
+                    f"{GAID_TAG_PREFIX}{g}" for g in sorted(gaids_emptied_by_exclusion)
+                )
+            )
+        print()
 
     # Annotate every row with the file's resource-status breakdown for that
     # GAID, so a reviewer can see at a glance whether an IP change (or a
