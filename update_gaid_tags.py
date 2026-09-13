@@ -18,24 +18,38 @@ WHAT IT DOES (see README.md for the rationale behind each rule):
   * NAME_CONTAINS tags are never written to; other unexpected rule types are
     refused rather than guessed at.
 
-Addresses in 169.254.0.0/16 and 192.168.0.0/16 are stripped from the file's
-IP set (see EXCLUDED_IP_NETWORKS). The filter is applied to the file only,
-never to what Qualys holds, so any such addresses already stored in a tag
-show up as removals and get cleaned out.
+WHICH ROWS COUNT
+  * Only rows whose RESOURCE STATUS is "In Service" contribute IP addresses.
+  * Addresses in 169.254.0.0/16 and 192.168.0.0/16 are stripped from the
+    file's IP set. Both filters apply to the FILE only, never to what Qualys
+    holds -- otherwise addresses already stored in a tag would be invisible
+    to the diff and could never be cleaned out.
+  * A GAID left with no addresses is reported untouched. Its tag is never
+    emptied: clearing a tag's scope is a far stronger act than updating it.
+
+TAG COLOUR (CSB003 3.2, by what the tag is BASED ON)
+  * #0000FF dark blue by default -- GAID tags are IP-range rules.
+  * #FF0000 red when the file's RVIT column says "yes" -- business-critical.
+  * Qualys stores colour as an integer and renders it WITHOUT zero-padding,
+    so #0000FF reads back as "#FF". Both sides are normalised before
+    comparing; skipping that would rewrite every blue tag on every run.
+  * A tag needing only a colour fix gets a write containing just <color>,
+    so such a write cannot touch its scope.
 
 HARD CONSTRAINTS:
 1. COMPLETE REPLACEMENT of each GAID tag's IP/range list with the set from
    the Excel file -- never a merge/union with what is currently in Qualys.
-2. EXISTING TAGS ARE UPDATED IN PLACE. The tag keeps its
-   id/name/parent/color/criticality -- only ruleText (and, for a static tag,
-   ruleType) changes. Never delete+recreate, because Qualys access scope is
-   bound to tag identity.
+2. EXISTING TAGS ARE UPDATED IN PLACE, never delete+recreate, because Qualys
+   access scope is bound to tag identity. The tag keeps its id, name, parent
+   and criticality; the script writes only ruleText, colour, and -- when
+   converting a static tag -- ruleType.
 
 RUN MODE: this script performs the REAL run by default -- it writes to
 Qualys, deletions included. Pass --dry-run to preview without writing.
 Every tag that will be modified or deleted is backed up to
 backup_gaid_tags_<UTC>.json/.xlsx before the first write call, and every
-write is verified by reading the tag back.
+write is verified by reading the tag back. A real run's report is stamped
+with the same UTC timestamp as its backup and can never be overwritten.
 """
 
 import argparse

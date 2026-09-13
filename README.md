@@ -56,11 +56,18 @@ Confirmed against a live tag (`[VFZ] GAID: 1356`, id `189526283`):
 - **Content:** `ruleText` — one comma-separated list mixing bare IPv4
   addresses and `A-B` hyphen ranges, e.g.
   `172.20.221.158-172.20.221.159,172.22.150.136,172.22.160.65-172.22.160.66`.
-- **`ruleText` is the only field this tool ever modifies on an existing tag.**
-  Name, parent, color, criticality and description are left untouched.
+- **On an existing tag this tool writes only `ruleText`, `color`, and —
+  when converting a static tag — `ruleType`.** Id, name, parent, criticality
+  and description are left untouched.
 
-Live rule-type distribution across the 464 GAID tags in the tenant:
-`NETWORK_RANGE` 349, static/blank 113, `NAME_CONTAINS` 1, `CLOUD_ASSET` 1.
+Tenant snapshot, 2026-09-13 (459 GAID tags, after the script had reconciled
+them). Counts drift — re-measure rather than trusting these:
+
+- **Rule type:** `NETWORK_RANGE` 358, static/blank 99, `NAME_CONTAINS` 1,
+  `CLOUD_ASSET` 1. The static ones are GAIDs with no IP rows in the file, so
+  there is nothing to convert them with.
+- **Colour:** `#0000FF` 383, `#FF0000` 76 — every GAID tag correctly
+  coloured, none missing.
 
 ---
 
@@ -146,13 +153,14 @@ Each GAID is matched to the Qualys tag named exactly
   entirely, never unioned or appended to.
 - **Updated in place, never delete-and-recreate.** Only
   `POST /qps/rest/2.0/update/am/tag/{id}` against the existing id, sending
-  only `<ruleType>` (unchanged — Qualys pairs it with `ruleText`) and the new
-  `<ruleText>`. Tag id, name, parent, color and criticality are preserved,
-  because Qualys access scope is bound to tag identity.
+  `<ruleType>` (unchanged — Qualys pairs it with `ruleText`), the new
+  `<ruleText>`, and `<color>` when the colour needs correcting. Tag id,
+  name, parent and criticality are preserved, because Qualys access scope is
+  bound to tag identity.
 - Before writing, the target id's current name is re-checked against the
   expected `[VFZ] GAID: <n>`; a mismatch aborts that row.
-- A tag whose set already matches is left alone with **no API call** and
-  reported as `updated` with an empty diff.
+- A tag whose IP set and colour already match is left alone with **no API
+  call** and reported as `updated` with an empty diff.
 
 ### Convert — static tag with IPs in the file
 
@@ -352,7 +360,7 @@ observed afterwards via each tag's `reEvalStatus` field.
   explanations), one sheet per non-empty outcome, and `All Rows`.
 - Columns: `tag_id`, `tag_name`, `status`, `file_resource_status`,
   `old_ip_summary`, `new_ip_summary`, `ips_added`, `ips_removed`,
-  `ips_excluded`, `error_message`.
+  `ips_excluded`, `color_change`, `error_message`.
 - `file_resource_status` shows the `RESOURCE STATUS` breakdown for that GAID
   across its IP-bearing rows (e.g. `In Service: 50, Out of Service: 1`), so
   every outcome explains itself without cross-referencing the source file.
@@ -363,6 +371,7 @@ observed afterwards via each tag's `reEvalStatus` field.
 | Status | Meaning |
 | --- | --- |
 | `dry-run-update` / `updated` | IP set rewritten in place |
+| `dry-run-color` / `updated` | IP set already correct; colour-only write |
 | `dry-run-convert` / `converted` | Static tag converted to dynamic `NETWORK_RANGE` |
 | `dry-run-create` / `created` | New tag created |
 | `dry-run-delete` / `deleted` | Tag deleted |
@@ -394,6 +403,8 @@ Constants at the top of `update_gaid_tags.py`:
 | `GAID_TAG_COLOR` / `GAID_TAG_COLOR_CRITICAL` | Default and RVIT=yes colours |
 | `RVIT_COLUMN_PATTERNS` / `RVIT_CRITICAL_VALUES` | Which GAIDs count as critical |
 | `NEW_TAG_DESCRIPTION_TEMPLATE` | Description given to new tags |
+| `EXCLUDED_IP_NETWORKS` | Address blocks stripped from the file's IP set |
+| `TAG_COLOR_SCHEME` | CSB003 3.2 colour standard, for reference |
 | `*_COLUMN_PATTERNS` | Excel header inference |
 | `MAX_RANGE_SIZE` | Guard against absurd IP ranges |
 
