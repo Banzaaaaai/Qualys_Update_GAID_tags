@@ -85,19 +85,30 @@ NEVER_UPDATE_RULE_TYPES = {"NAME_CONTAINS"}
 # when it does not, the tag is left alone.
 STATIC_RULE_TYPES = {"", "STATIC"}
 
-# Attributes given to newly created GAID tags, mirroring the convention of
+# CSB003 section 3.2 tag colour standard, kept here for reference. A tag's
+# colour is chosen by what the tag is BASED ON, not by what it contains.
+TAG_COLOR_SCHEME = {
+    "#FF0000": "Red - important for business, critical tags",
+    "#FF9900": "Orange - negative signals, something went wrong",
+    "#FFFF00": "Yellow - users, user roles, departments",
+    "#00FF00": "Green - successful and positive signals",
+    "#0000FF": "Dark blue - IP addresses, domains, asset groups",
+    "#9900FF": "Purple - technologies (OS, software, hardware)",
+    "#FF00FF": "Fuchsia - projects or project communication",
+    "#00FFFF": "Teal - vulnerability QID, EOL",
+}
+
+# GAID tags are NETWORK_RANGE rules, so they are dark blue by default.
+# A GAID flagged RVIT=yes in the file is business-critical and goes red.
+GAID_TAG_COLOR = "#0000FF"
+GAID_TAG_COLOR_CRITICAL = "#FF0000"
+RVIT_COLUMN_PATTERNS = [r"^\s*rvit\s*$"]
+RVIT_CRITICAL_VALUES = {"yes"}
+
+# Description given to newly created GAID tags, mirroring the convention of
 # tags that already exist in the tenant (e.g. "Toolbox (GAID: 1356)"). The
 # parent tag id is resolved at runtime by looking up GAID_PARENT_TAG_NAME,
-# so it is never hardcoded/stale.
-#
-# Color is deliberately left empty. Existing GAID tags in this tenant store
-# "#FF", but the live tag.xsd restricts color to #RGB or #RRGGBB
-# (pattern "#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?"), so sending "#FF" back would
-# be rejected -- that stored value predates or bypasses validation. Rather
-# than invent a color the tenant never chose, the element is omitted and
-# Qualys applies its own default. Set this to a valid 3- or 6-digit hex
-# value (e.g. "#FFFFFF") if new tags should have a specific color.
-NEW_TAG_COLOR = ""
+# so it is never hardcoded/stale. Colour comes from GAID_TAG_COLOR above.
 NEW_TAG_DESCRIPTION_TEMPLATE = "{asset} (GAID: {gaid})"
 ASSET_NAME_COLUMN_PATTERNS = [r"^\s*asset\s*$", r"asset\s*name", r"application\s*name"]
 
@@ -122,6 +133,7 @@ REPORT_COLUMNS = [
     "ips_added",
     "ips_removed",
     "ips_excluded",
+    "color_change",
     "error_message",
 ]
 
@@ -500,6 +512,26 @@ def normalize_ip_set(raw_tokens):
     return ordered, invalid
 
 
+def normalize_color(value):
+    """Canonicalise a Qualys colour to '#RRGGBB' for comparison.
+
+    Qualys stores colour as an integer and renders it without zero-padding,
+    so '#0000FF' comes back as '#FF', '#00FF00' as '#FF00' and '#00FFFF' as
+    '#FFFF'. Comparing raw strings would therefore see every blue tag as
+    needing a rewrite on every single run. Returns '' for missing/unparseable
+    values.
+    """
+    if not value:
+        return ""
+    text = str(value).strip().lstrip("#")
+    if not text:
+        return ""
+    try:
+        return f"#{int(text, 16):06X}"
+    except ValueError:
+        return ""
+
+
 def drop_excluded_networks(entries):
     """Strip addresses in EXCLUDED_IP_NETWORKS from canonical IP entries.
 
@@ -585,6 +617,7 @@ def discover_excel(path):
     ip_col = find_column(headers, IP_COLUMN_PATTERNS)
     status_col = find_column(headers, RESOURCE_STATUS_COLUMN_PATTERNS)
     asset_col = find_column(headers, ASSET_NAME_COLUMN_PATTERNS)
+    rvit_col = find_column(headers, RVIT_COLUMN_PATTERNS)
 
     if gaid_col is None or ip_col is None:
         raise RuntimeError(
@@ -611,6 +644,17 @@ def discover_excel(path):
         "semicolons/newlines and grouped by GAID, so both layouts are "
         "handled by the same aggregation logic.)"
     )
+    if rvit_col is not None:
+        print(
+            f"  RVIT column: {headers[rvit_col]!r} (index {rvit_col}) -- GAIDs with "
+            f"{sorted(RVIT_CRITICAL_VALUES)!r} are coloured {GAID_TAG_COLOR_CRITICAL} "
+            f"(critical); all others {GAID_TAG_COLOR}."
+        )
+    else:
+        print(
+            f"  WARNING: no RVIT column matched {RVIT_COLUMN_PATTERNS!r}; every "
+            f"GAID tag will be coloured {GAID_TAG_COLOR}."
+        )
     if asset_col is not None:
         print(
             f"  Asset name column: {headers[asset_col]!r} (index {asset_col}) "
@@ -636,7 +680,26 @@ def discover_excel(path):
         )
     print()
 
-    return sheet_name, headers, rows, gaid_col, ip_col, status_col, asset_col
+    return sheet_name, headers, rows, gaid_col, ip_col, status_col, asset_col, rvit_col
+
+
+def collect_critical_gaids(rows, gaid_col, rvit_col):
+    """GAIDs flagged business-critical via the RVIT column."""
+    if rvit_col is None:
+        return set()
+    critical = set()
+    for row in rows:
+        gaid_key = normalize_gaid_key(row[gaid_col])
+        if gaid_key is None:
+            continue
+        value = row[rvit_col]
+        if value is not None and str(value).strip().lower() in RVIT_CRITICAL_VALUES:
+            critical.add(gaid_key)
+    return critical
+
+
+def desired_color_for(gaid_key, critical_gaids):
+    return GAID_TAG_COLOR_CRITICAL if gaid_key in critical_gaids else GAID_TAG_COLOR
 
 
 def collect_file_gaids(rows, gaid_col, asset_col=None):
@@ -833,6 +896,7 @@ REPORT_COLUMN_WIDTHS = {
     "ips_added": 40,
     "ips_removed": 40,
     "ips_excluded": 40,
+    "color_change": 24,
     "error_message": 44,
 }
 WRAP_COLUMNS = (
@@ -882,6 +946,7 @@ def _split_rows_by_bucket(rows):
         "Would Update": [r for r in dry if r.get("ips_added") or r.get("ips_removed")],
         "No Change": [r for r in dry if not (r.get("ips_added") or r.get("ips_removed"))],
         "Would Convert": [r for r in rows if r["status"] == "dry-run-convert"],
+        "Would Recolour": [r for r in rows if r["status"] == "dry-run-color"],
         "Would Create": [r for r in rows if r["status"] == "dry-run-create"],
         "Would Delete": [r for r in rows if r["status"] == "dry-run-delete"],
         "Updated": [r for r in rows if r["status"] == "updated"],
@@ -923,6 +988,10 @@ def write_xlsx_report(rows, path, run_meta=None):
         "Would Convert": (
             "Static tag with IPs in the file -> would become a dynamic "
             "NETWORK_RANGE tag on --apply"
+        ),
+        "Would Recolour": (
+            "IP set already correct; only the tag colour needs fixing -> "
+            "colour-only write, ruleText untouched"
         ),
         "Converted": "Static tag converted in place to dynamic NETWORK_RANGE and verified",
         "Skipped NAME_CONTAINS": (
@@ -1010,13 +1079,16 @@ def main():
         print()
 
     print(f"=== Discovery: {args.excel_path} ===")
-    _, _, rows, gaid_col, ip_col, status_col, asset_col = discover_excel(args.excel_path)
+    _, _, rows, gaid_col, ip_col, status_col, asset_col, rvit_col = discover_excel(
+        args.excel_path
+    )
     raw_by_gaid, excluded_rows, excluded_tokens, fully_filtered_gaids = build_gaid_ip_map(
         rows, gaid_col, ip_col, status_col
     )
     all_gaids_in_file, asset_by_gaid = collect_file_gaids(rows, gaid_col, asset_col)
     status_summary_by_gaid = build_status_summary(rows, gaid_col, ip_col, status_col)
     decommissioned_gaids = find_decommissioned_gaids(rows, gaid_col, status_col)
+    critical_gaids = collect_critical_gaids(rows, gaid_col, rvit_col)
     print(
         f"Found {len(all_gaids_in_file)} distinct GAID(s) in the file "
         f"({len(raw_by_gaid)} of them contribute IPs)."
@@ -1061,6 +1133,8 @@ def main():
         "Never updated (ruleType)": ", ".join(sorted(NEVER_UPDATE_RULE_TYPES)),
         "Static tags": "converted to dynamic NETWORK_RANGE when the file has IPs, else untouched",
         "Excluded IP blocks": ", ".join(EXCLUDED_IP_NETWORKS),
+        "Tag colour": f"{GAID_TAG_COLOR} default, {GAID_TAG_COLOR_CRITICAL} when RVIT=yes",
+        "Critical GAIDs in file (RVIT=yes)": len(critical_gaids),
         "Resource status filter": (
             ", ".join(sorted(INCLUDE_RESOURCE_STATUSES)) if status_col is not None else "(none)"
         ),
@@ -1100,6 +1174,7 @@ def main():
 
     for gaid_key, raw_tokens in sorted(raw_by_gaid.items(), key=lambda kv: (len(kv[0]), kv[0])):
         expected_name = f"{GAID_TAG_PREFIX}{gaid_key}"
+        want_color = desired_color_for(gaid_key, critical_gaids)
         new_ips, invalid_tokens = normalize_ip_set(raw_tokens)
         had_ips_before_exclusion = bool(new_ips)
         new_ips, excluded_ips = drop_excluded_networks(new_ips)
@@ -1154,9 +1229,11 @@ def main():
                     "ips_added": ", ".join(new_ips),
                     "ips_removed": "",
                     "ips_excluded": ", ".join(excluded_ips),
+                    "color_change": f"(new) -> {want_color}",
                     "error_message": "",
                     "_new_ips": new_ips,
                     "_description": description,
+                    "_new_color": want_color,
                 }
             )
             continue
@@ -1168,22 +1245,38 @@ def main():
         # effect of filtering out irrelevant address blocks.
         if not new_ips and not invalid_tokens:
             old_ips, _ = parse_qualys_rule_text(tag["rule_text"])
+            why = (
+                "all IPs for this GAID are in excluded blocks "
+                f"({', '.join(EXCLUDED_IP_NETWORKS)}); rule left as-is, not cleared"
+                if excluded_ips
+                else "no usable IPs in file; rule left as-is, not cleared"
+            )
+            color_differs = normalize_color(tag["color"]) != normalize_color(want_color)
+            # The rule is left alone, but the colour can still be corrected:
+            # a colour-only write never touches ruleText.
             report_rows.append(
                 {
                     "tag_id": tag["tag_id"],
                     "tag_name": expected_name,
-                    "status": "untouched",
+                    "status": ("pending" if args.apply else "dry-run-color")
+                    if color_differs
+                    else "untouched",
                     "old_ip_summary": ", ".join(old_ips),
                     "new_ip_summary": "",
                     "ips_added": "",
                     "ips_removed": "",
                     "ips_excluded": ", ".join(excluded_ips),
-                    "error_message": (
-                        "all IPs for this GAID are in excluded blocks "
-                        f"({', '.join(EXCLUDED_IP_NETWORKS)}); tag left as-is, not cleared"
-                        if excluded_ips
-                        else "no usable IPs in file; tag left as-is, not cleared"
+                    "color_change": (
+                        f"{normalize_color(tag['color']) or '(none)'} -> {want_color}"
+                        if color_differs
+                        else ""
                     ),
+                    "error_message": why + ("; colour corrected" if color_differs else ""),
+                    "_new_ips": [],
+                    "_has_diff": color_differs,
+                    "_color_only": True,
+                    "_new_color": want_color if color_differs else "",
+                    "_tag": tag,
                 }
             )
             continue
@@ -1249,10 +1342,14 @@ def main():
         added = sorted(new_set - old_set, key=lambda c: new_ips.index(c) if c in new_ips else 0)
         removed = sorted(old_set - new_set, key=lambda c: old_ips.index(c) if c in old_ips else 0)
 
+        color_differs = normalize_color(tag["color"]) != normalize_color(want_color)
+
         if args.apply:
             row_status = "pending"
         elif is_conversion:
             row_status = "dry-run-convert"
+        elif not (old_set != new_set) and color_differs:
+            row_status = "dry-run-color"
         else:
             row_status = "dry-run-update"
 
@@ -1266,6 +1363,11 @@ def main():
                 "ips_added": ", ".join(added),
                 "ips_removed": ", ".join(removed),
                 "ips_excluded": ", ".join(excluded_ips),
+                "color_change": (
+                    f"{normalize_color(tag['color']) or '(none)'} -> {want_color}"
+                    if color_differs
+                    else ""
+                ),
                 "error_message": (
                     f"static tag -> converting to dynamic {EXPECTED_RULE_TYPE}"
                     if is_conversion
@@ -1274,8 +1376,9 @@ def main():
                 "_new_ips": new_ips,
                 # A static tag has no rule at all, so converting it always
                 # counts as a change even though there is nothing to diff.
-                "_has_diff": old_set != new_set or is_conversion,
+                "_has_diff": old_set != new_set or is_conversion or color_differs,
                 "_is_conversion": is_conversion,
+                "_new_color": want_color if color_differs else "",
                 "_tag": tag,
             }
         )
@@ -1440,13 +1543,20 @@ def apply_one_update(session, row):
         )
         return
 
-    new_rule_text = ",".join(new_ips)
-    xml_body = (
-        "<ServiceRequest><data><Tag>"
-        f"<ruleType>{EXPECTED_RULE_TYPE}</ruleType>"
-        f"<ruleText>{xml_escape(new_rule_text)}</ruleText>"
-        "</Tag></data></ServiceRequest>"
-    )
+    new_color = row.get("_new_color", "")
+    if row.get("_color_only"):
+        # Nothing to say about the rule -- sending ruleText here would be the
+        # one way this path could damage a tag's scope.
+        fields = f"<color>{xml_escape(new_color)}</color>"
+    else:
+        new_rule_text = ",".join(new_ips)
+        fields = (
+            f"<ruleType>{EXPECTED_RULE_TYPE}</ruleType>"
+            f"<ruleText>{xml_escape(new_rule_text)}</ruleText>"
+        )
+        if new_color:
+            fields += f"<color>{xml_escape(new_color)}</color>"
+    xml_body = f"<ServiceRequest><data><Tag>{fields}</Tag></data></ServiceRequest>"
 
     try:
         request_with_retry(
@@ -1467,38 +1577,47 @@ def apply_one_update(session, row):
         row["error_message"] = "update call succeeded but tag not found on read-back"
         return
 
-    stored_ips, _ = parse_qualys_rule_text(verify_tag["rule_text"])
-    if set(stored_ips) != set(new_ips):
-        row["status"] = "error"
-        row["error_message"] = (
-            "post-update verification failed: stored IPs do not match intended set "
-            f"(stored={stored_ips!r}, expected={new_ips!r})"
-        )
-        return
+    if not row.get("_color_only"):
+        stored_ips, _ = parse_qualys_rule_text(verify_tag["rule_text"])
+        if set(stored_ips) != set(new_ips):
+            row["status"] = "error"
+            row["error_message"] = (
+                "post-update verification failed: stored IPs do not match intended set "
+                f"(stored={stored_ips!r}, expected={new_ips!r})"
+            )
+            return
 
-    # The tag must end up dynamic/NETWORK_RANGE -- this is the only check
-    # that proves a static tag actually converted rather than silently
-    # keeping its old form.
-    if verify_tag["rule_type"] != EXPECTED_RULE_TYPE:
+        # The tag must end up dynamic/NETWORK_RANGE -- this is the only check
+        # that proves a static tag actually converted rather than silently
+        # keeping its old form.
+        if verify_tag["rule_type"] != EXPECTED_RULE_TYPE:
+            row["status"] = "error"
+            row["error_message"] = (
+                "post-update verification failed: ruleType is "
+                f"{verify_tag['rule_type']!r}, expected {EXPECTED_RULE_TYPE!r}"
+            )
+            return
+
+    if new_color and normalize_color(verify_tag["color"]) != normalize_color(new_color):
         row["status"] = "error"
         row["error_message"] = (
-            "post-update verification failed: ruleType is "
-            f"{verify_tag['rule_type']!r}, expected {EXPECTED_RULE_TYPE!r}"
+            "post-update verification failed: colour is "
+            f"{normalize_color(verify_tag['color'])!r}, expected {normalize_color(new_color)!r}"
         )
         return
 
     row["status"] = "converted" if row.get("_is_conversion") else "updated"
 
 
-def build_create_xml(name, parent_tag_id, rule_text, description):
+def build_create_xml(name, parent_tag_id, rule_text, description, color=""):
     parts = [
         f"<name>{xml_escape(name)}</name>",
         f"<parentTagId>{xml_escape(str(parent_tag_id))}</parentTagId>",
         f"<ruleType>{EXPECTED_RULE_TYPE}</ruleType>",
         f"<ruleText>{xml_escape(rule_text)}</ruleText>",
     ]
-    if NEW_TAG_COLOR:
-        parts.append(f"<color>{xml_escape(NEW_TAG_COLOR)}</color>")
+    if color:
+        parts.append(f"<color>{xml_escape(color)}</color>")
     if description:
         parts.append(f"<description>{xml_escape(description)}</description>")
     return "<ServiceRequest><data><Tag>" + "".join(parts) + "</Tag></data></ServiceRequest>"
@@ -1519,7 +1638,13 @@ def apply_one_create(session, row, parent_tag_id):
         )
         return
 
-    xml_body = build_create_xml(name, parent_tag_id, ",".join(new_ips), row.get("_description", ""))
+    xml_body = build_create_xml(
+        name,
+        parent_tag_id,
+        ",".join(new_ips),
+        row.get("_description", ""),
+        row.get("_new_color", ""),
+    )
 
     try:
         request_with_retry(session, "POST", TAG_CREATE_URL, xml_body, f"create tag {name!r}")
@@ -1613,6 +1738,8 @@ def print_action_plan(report_rows):
         elif status == "dry-run-convert":
             print(f"  [would CONVERT to dynamic] {r['tag_name']} (id {r['tag_id']})")
             print(f"      static tag -> {EXPECTED_RULE_TYPE} with: {r['new_ip_summary']}")
+        elif status == "dry-run-color":
+            print(f"  [would RECOLOUR] {r['tag_name']} (id {r['tag_id']}) {r['color_change']}")
         elif status == "dry-run-create":
             print(f"  [would CREATE] {r['tag_name']}")
             print(f"      description: {r.get('_description', '') or '(none)'}")
@@ -1684,6 +1811,7 @@ def print_summary(report_rows, applied):
         print(f"Would update (real diff): {dry_run_real_diff}")
         print(f"Matched, no change:       {len(dry_run_rows) - dry_run_real_diff}")
         print(f"Would convert to dynamic: {count('dry-run-convert')}")
+        print(f"Would recolour only:      {count('dry-run-color')}")
         print(f"Would create:             {count('dry-run-create')}")
         print(f"Would DELETE:             {count('dry-run-delete')}")
     print(f"Skipped NAME_CONTAINS:    {count('skipped-name-contains')}")

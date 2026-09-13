@@ -171,10 +171,7 @@ Each GAID is matched to the Qualys tag named exactly
   - `parentTagId` = id of `[VFZ] Global Application Inventory`, resolved by
     name at runtime
   - `ruleType` = `NETWORK_RANGE`, `ruleText` = the file's IP set
-  - `color` — omitted by default. Existing GAID tags store `#FF`, but the
-    live XSD restricts color to `#RGB`/`#RRGGBB`, so echoing `#FF` back
-    would be rejected. Set `NEW_TAG_COLOR` to a valid 3- or 6-digit hex
-    value if new tags should have a specific color.
+  - `color` — per the colour rule below.
   - `description` = `<ASSET> (GAID: <n>)`, mirroring existing tags such as
     `Toolbox (GAID: 1356)`
 - A GAID with no valid IPs is **never created as an empty tag** — reported
@@ -239,6 +236,53 @@ Important qualifications:
 | other (e.g. `CLOUD_ASSET`) | yes | Refused as `error` |
 
 ---
+
+## Tag colour
+
+Colour is managed on every tag the script creates or updates, per the CSB003
+section 3.2 standard (kept in `TAG_COLOR_SCHEME` for reference), which
+assigns colour by what a tag is **based on**:
+
+| Colour | Meaning |
+| --- | --- |
+| `#FF0000` Red | important for business, critical |
+| `#FF9900` Orange | negative signals, something went wrong |
+| `#FFFF00` Yellow | users, user roles, departments |
+| `#00FF00` Green | successful and positive signals |
+| `#0000FF` Dark blue | IP addresses, domains, asset groups |
+| `#9900FF` Purple | technologies (OS, software, hardware) |
+| `#FF00FF` Fuchsia | projects or project communication |
+| `#00FFFF` Teal | vulnerability QID, EOL |
+
+GAID tags are `NETWORK_RANGE` (IP-based) rules, so:
+
+- **`#0000FF` dark blue by default** (`GAID_TAG_COLOR`).
+- **`#FF0000` red when the file's `RVIT` column says `yes`** for that GAID
+  (`GAID_TAG_COLOR_CRITICAL`) — business-critical. RVIT is consistent per
+  GAID in the export (0 conflicting rows), and 79 GAIDs are flagged.
+
+### Qualys truncates colours — normalise before comparing
+
+Qualys stores colour as an integer and renders it **without zero-padding**,
+so what you read back is not what you wrote:
+
+| Written | Read back |
+| --- | --- |
+| `#0000FF` | `#FF` |
+| `#00FF00` | `#FF00` |
+| `#00FFFF` | `#FFFF` |
+| `#FF0000` | `#FF0000` (unchanged) |
+
+`normalize_color()` zero-pads both sides before comparing. **Without this the
+script would see every blue tag as mis-coloured and rewrite all of them on
+every single run, forever.** It also explains an earlier wrong conclusion:
+`#FF` looks like red but is actually blue.
+
+A tag whose IP set is already correct but whose colour is wrong gets a
+**colour-only write containing just `<color>`** — `ruleText` is not sent at
+all, so such a write cannot affect the tag's scope. These appear under the
+`Would Recolour` / `color_change` report columns. The post-write read-back
+asserts the stored colour matches.
 
 ## Rule evaluation ("Evaluate Rule on Creation")
 
@@ -347,7 +391,9 @@ Constants at the top of `update_gaid_tags.py`:
 | `STATIC_RULE_TYPES` | What counts as a static tag (`""`, `STATIC`) |
 | `INCLUDE_RESOURCE_STATUSES` | Statuses whose rows contribute IPs |
 | `DELETE_ON_RESOURCE_STATUSES` | Statuses that mark a GAID decommissioned |
-| `NEW_TAG_COLOR` / `NEW_TAG_DESCRIPTION_TEMPLATE` | New tag appearance |
+| `GAID_TAG_COLOR` / `GAID_TAG_COLOR_CRITICAL` | Default and RVIT=yes colours |
+| `RVIT_COLUMN_PATTERNS` / `RVIT_CRITICAL_VALUES` | Which GAIDs count as critical |
+| `NEW_TAG_DESCRIPTION_TEMPLATE` | Description given to new tags |
 | `*_COLUMN_PATTERNS` | Excel header inference |
 | `MAX_RANGE_SIZE` | Guard against absurd IP ranges |
 
